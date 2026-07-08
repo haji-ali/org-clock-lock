@@ -425,7 +425,10 @@ Key bindings inside the picker:
         (when expand-state (setcar expand-state expand-all))
         (let* ((repeat nil)
                (markers (if expand-all
-                            (cl::all-task-markers (seq-copy sub-cands) breaks)
+                            (nreverse
+                             (cl::all-task-markers t (nreverse
+                                                      (seq-copy sub-cands))
+                                                   breaks))
                           sub-cands))
                (cands   (cl::format-candidates markers t))
                (fprompt (concat
@@ -457,21 +460,27 @@ Key bindings inside the picker:
           (when result
             (throw 'done (or (cdr (assoc result cands #'string=)) result))))))))
 
-(defun cl::all-task-markers (markers &optional break-only)
+(defun cl::all-task-markers (match &optional markers break-only)
   "Return markers for ALL not-done agenda tasks (no recency filter).
 Existing MARKERS are preserved; new ones appended."
-  (setq markers (nreverse markers))
+  ;; (setq markers (nreverse markers))
   (org-map-entries
    (lambda ()
      (let ((m (point-marker)))
        (unless (member m markers) (push m markers))))
-   t 'agenda
+   match 'agenda
    (lambda ()
-     (or (org-agenda-skip-entry-if 'todo 'done)
-         (and break-only
-              (when (not (org-entry-get (point) "BREAK"))
-                (org-entry-end-position))))))
-  (nreverse markers))
+     (or
+      (and (progn
+             (org-back-to-heading t)
+             (org-agenda-skip-if-todo '(todo done) (org-entry-end-position)))
+           (save-excursion
+             (org-end-of-subtree t)
+             (point)))
+      (and break-only
+           (when (not (org-entry-get (point) "BREAK"))
+             (org-entry-end-position))))))
+  markers)
 
 (defun cl::candidate-markers (&optional break-only)
   "Collect candidate markers: context, clock history, today's agenda."
@@ -484,11 +493,10 @@ Existing MARKERS are preserved; new ones appended."
       (when (derived-mode-p 'org-mode)
         (add (save-excursion (org-back-to-heading t) (point-marker))))
       (dolist (m org-clock-history) (add m))
-      (org-map-entries
-       (lambda () (add (point-marker)))
-       "SCHEDULED<=\"<today>\"|DEADLINE<=\"<today>\""
-       'agenda
-       (lambda () (org-agenda-skip-entry-if 'todo 'done))))
+      (setq markers
+            (cl::all-task-markers
+             "SCHEDULED<=\"<today>\"|DEADLINE<=\"<today>\""
+             markers)))
     (let ((result (nreverse markers)))
       (if break-only
           (cl-remove-if-not #'cl::marker-is-break-p result)
