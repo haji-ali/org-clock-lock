@@ -789,7 +789,8 @@ The function loops until the user commits a fully resolved choice."
                         (if (and base (<= mins base))
                             ;; Clock-out
                             (list :marker nil :keep mins :duration nil)
-                          (list :marker marker :keep 'all :duration mins)))))))))))
+                          (list :marker marker :keep base
+                                :duration (- mins base))))))))))))
     result))
 
 (defun cl::interrupt-prompt ()
@@ -834,11 +835,14 @@ user's fully committed choice.  Dispatches the result:
                 (duration (plist-get choice :duration))
                 (resume-p (and marker
                                (cl::markers-equal-p marker prev-marker)
-                               (eq keep 'all))))
+                               duration)))
            (if resume-p
                ;; Resume: same task, no absent time discarded — continue=t
                ;; so planned minutes accumulate correctly.
-               (cl::begin-session prev-title (copy-marker prev-marker) duration t)
+               (cl::begin-session prev-title
+                                  (copy-marker prev-marker)
+                                  duration
+                                  (or keep 0))
              ;; Clock out the previous task at the appropriate time.
              (if (eq keep 'all)
                  (cl::org-clock-out nil t)
@@ -852,7 +856,7 @@ user's fully committed choice.  Dispatches the result:
                                       (copy-marker marker)
                                     (cl::capture-org-task
                                      title (and break-p '(("BREAK" . "t")))))))
-                 (cl::begin-session title new-marker duration nil))))))))))
+                 (cl::begin-session title new-marker duration))))))))))
 
 ;;; Org-clock integration
 
@@ -904,7 +908,10 @@ previous planned total."
     (setq cl::locked-p nil)
     (let* ((prev-planned (and continue cl::session
                               (cl::session-planned-minutes cl::session)))
-           (planned    (+ (or prev-planned 0) minutes))
+           (planned    (+ (or prev-planned 0) minutes
+                          (if (numberp continue)
+                              continue
+                            0)))
            (break-p    (if (and continue cl::session)
                            (cl::session-break-p cl::session)
                          (cl::marker-is-break-p marker))))
