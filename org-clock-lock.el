@@ -83,6 +83,21 @@ conservative enough to survive heavy GC pauses on slow machines while
 still catching even the briefest sleep."
   :type 'natnum)
 
+(defcustom cl:lock-layout-function #'delete-other-windows
+  "Function that arranges a frame's windows for the lock screen.
+The function should create whatever window layout it wants. The caller
+will switch the selected window to the lock buffer.
+
+To reserve part of the frame for note-taking while locked, for example:
+
+  (setq org-clock-lock-lock-layout-function
+        (lambda ()
+          (delete-other-windows)
+          (split-window-right)
+          (switch-to-buffer \"*scratch*\")
+          (other-window 1)))"
+  :type 'function)
+
 (defcustom cl:clock-out-on-sleep nil
   "Non-nil to clock out automatically when a sleep/wake cycle is detected.
 The clock entry is ended at the last known awake time (i.e. the tick
@@ -140,9 +155,7 @@ same retroactive clock-out options as for keyboard idle."
                    find-file find-file-other-window find-file-other-frame
                    find-alternate-file
                    split-window-below split-window-right
-                   delete-window delete-other-windows
-                   other-window
-                   windmove-left windmove-right windmove-up windmove-down))
+                   delete-window delete-other-windows))
       (define-key map (vector 'remap cmd) #'cl:blocked))
     (dolist (key '("C-h" "C-x 5" "C-x 4" "C-x t" "C-c p"))
       (define-key map (kbd key) #'cl:blocked))
@@ -232,23 +245,36 @@ can read session data such as title, marker, and planned minutes.")
   "Format MINUTES as HH:MM."
   (format "%d:%02d" (/ minutes 60) (% minutes 60)))
 
+(defun cl::apply-lock-layout (buf)
+  "Run `cl:lock-layout-function' in the selected frame and switch to BUF."
+  (with-demoted-errors
+      (funcall cl:lock-layout-function))
+  (switch-to-buffer buf t))
+
+(defun cl::lockable-frame-p (frame)
+  "Non-nil if FRAME is a normal frame that should show the lock screen.
+Excludes invisible/iconified frames and child frames (e.g. those used
+by posframe-style popups), since those aren't independent frames the
+user interacts with directly."
+  (and (eq (frame-visible-p frame) t)
+       (not (frame-parameter frame 'parent-frame))))
+
 (defun cl::enforce-lock-screen ()
-  "Ensure every live frame shows the lock buffer.
+  "Ensure every live, lockable frame's window layout includes the lock buffer.
 Frames not yet in `cl::saved-frame-wconfs' have their window
-configuration saved first."
+configuration saved first.  See `cl::lockable-frame-p' for which frames
+are considered."
   (when cl::locked-p
     (let ((buf (cl::ensure-lock-buffer)))
       (dolist (frame (frame-list))
-        (when (frame-live-p frame)
+        (when (and (frame-live-p frame) (cl::lockable-frame-p frame))
           (unless (assq frame cl::saved-frame-wconfs)
             (push (cons frame (with-selected-frame frame
                                 (current-window-configuration)))
                   cl::saved-frame-wconfs))
-          (unless (and (eq (window-buffer (frame-selected-window frame)) buf)
-                       (= 1 (length (window-list frame))))
+          (unless (get-buffer-window buf frame)
             (with-selected-frame frame
-              (delete-other-windows)
-              (switch-to-buffer buf t))))))))
+              (cl::apply-lock-layout buf))))))))
 
 (defun cl:blocked ()
   "Feedback for blocked commands on the lock screen."
@@ -1428,19 +1454,20 @@ is pending; the time is shown in warning face."
         b)))
 
 (defun cl::show-lock-screen ()
-  "Save each frame's window config and show the lock buffer everywhere.
+  "Save each lockable frame's window config and show the lock buffer.
 Creates and renders the buffer skeleton on first call; refreshes the
-clock report on every call so it reflects current clocking data."
-  (setq cl::saved-frame-wconfs
-        (mapcar (lambda (f)
-                  (cons f (with-selected-frame f (current-window-configuration))))
-                (frame-list)))
-  (let ((buf (cl::ensure-lock-buffer)))
-    (cl::update-clock-report)
-    (dolist (f (frame-list))
-      (with-selected-frame f
-        (delete-other-windows)
-        (switch-to-buffer buf t)))))
+clock report on every call so it reflects current clocking data.  See
+`cl::lockable-frame-p' for which frames are considered."
+  (let ((frames (cl-remove-if-not #'cl::lockable-frame-p (frame-list))))
+    (setq cl::saved-frame-wconfs
+          (mapcar (lambda (f)
+                    (cons f (with-selected-frame f (current-window-configuration))))
+                  frames))
+    (let ((buf (cl::ensure-lock-buffer)))
+      (cl::update-clock-report)
+      (dolist (f frames)
+        (with-selected-frame f
+          (cl::apply-lock-layout buf))))))
 
 (defun cl::hide-lock-screen ()
   "Restore each frame's saved window configuration."
