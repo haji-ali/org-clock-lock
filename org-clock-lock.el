@@ -155,7 +155,8 @@ same retroactive clock-out options as for keyboard idle."
                    find-file find-file-other-window find-file-other-frame
                    find-alternate-file
                    split-window-below split-window-right
-                   delete-window delete-other-windows))
+                   delete-window delete-other-windows
+                   eval-last-sexp eval-buffer eval-region))
       (define-key map (vector 'remap cmd) #'cl:blocked))
     (dolist (key '("C-h" "C-x 5" "C-x 4" "C-x t" "C-c p"))
       (define-key map (kbd key) #'cl:blocked))
