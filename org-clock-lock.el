@@ -787,11 +787,11 @@ The function loops until the user commits a fully resolved choice."
                 ;; nil mins = C-g at duration prompt → loop back to task picker
                 (when mins
                   (setq result
-                        (if (and base (<= mins base))
+                        (if (and same-p (<= mins base))
                             ;; Clock-out
                             (list :marker nil :keep mins :duration nil)
                           (list :marker marker :keep base
-                                :duration (- mins base))))))))))))
+                                :duration (if same-p (- mins base) mins))))))))))))
     result))
 
 (defun cl::interrupt-prompt ()
