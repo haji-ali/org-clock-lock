@@ -401,9 +401,10 @@ The prompt is extended with \", +N from now\" to advertise the syntax."
   (let (result)
     (while (null result)
       (let* ((raw    (read-string
-                      (format (if base "%s [%d min, +N from now]: "
-                                "%s [%d min]: ")
-                              prompt default)
+                      (if base
+                          (format "%s [default: %d min, >%d, +N from now]: "
+                                  prompt default base)
+                        (format "%s [default: %d min]: " prompt default))
                       nil nil (number-to-string default)))
              (rel-p  (and base (string-prefix-p "+" raw)))
              (n      (if (string-empty-p raw)
