@@ -335,37 +335,40 @@ When nil, a plain TODO is appended to `org-default-notes-file'."
   "Create an org task with TITLE and return a marker pointing at it.
 If `cl:capture-template-key' is set, run that org-capture template with
 TITLE substituted for all interactive placeholders, finalising immediately
-without user interaction.  PROPERTIES is ignored in this path.
+without user interaction.
 If `cl:capture-template-key' is nil, append a plain TODO to
-`org-default-notes-file', including any PROPERTIES drawer."
-  (if cl:capture-template-key
-      (let* ((entry   (cl::find-capture-template cl:capture-template-key))
-             ;; Substitute title into template string and force immediate-finish
-             (filled  (cl::capture-fill-template entry title))
-             (org-capture-templates (list filled))
-             ;; %i expands to org-capture-initial
-             (org-capture-initial title))
-        (org-capture nil cl:capture-template-key)
-        ;; org-capture with :immediate-finish stores the marker here
-        (when (markerp org-capture-last-stored-marker)
-          (copy-marker org-capture-last-stored-marker)))
-    ;; Built-in fallback: append to notes file
-    (let ((file (or org-default-notes-file (expand-file-name "notes.org" "~"))))
-      (unless (file-exists-p file)
-        (make-directory (file-name-directory file) t)
-        (write-region "" nil file))
-      (with-current-buffer (find-file-noselect file)
-        (goto-char (point-max))
-        (unless (bolp) (insert "\n"))
-        (let ((pos (point-marker)))
-          (insert "* TODO " title "\n")
-          (when properties
-            (insert ":PROPERTIES:\n")
-            (dolist (kv properties)
-              (insert (format ":%s: %s\n" (car kv) (cdr kv))))
-            (insert ":END:\n"))
-          (save-buffer)
-          pos)))))
+`org-default-notes-file'.
+PROPERTIES, an alist of (NAME . VALUE), is set on the resulting heading
+in either case."
+  (let ((marker
+         (if cl:capture-template-key
+             (let* ((entry   (cl::find-capture-template cl:capture-template-key))
+                    ;; Substitute title into template string and force immediate-finish
+                    (filled  (cl::capture-fill-template entry title))
+                    (org-capture-templates (list filled))
+                    ;; %i expands to org-capture-initial
+                    (org-capture-initial title))
+               (org-capture nil cl:capture-template-key)
+               ;; org-capture with :immediate-finish stores the marker here
+               (when (markerp org-capture-last-stored-marker)
+                 (copy-marker org-capture-last-stored-marker)))
+           ;; Built-in fallback: append to notes file
+           (let ((file (or org-default-notes-file (expand-file-name "notes.org" "~"))))
+             (unless (file-exists-p file)
+               (make-directory (file-name-directory file) t)
+               (write-region "" nil file))
+             (with-current-buffer (find-file-noselect file)
+               (goto-char (point-max))
+               (unless (bolp) (insert "\n"))
+               (let ((pos (point-marker)))
+                 (insert "* TODO " title "\n")
+                 (save-buffer)
+                 pos))))))
+    (when (and marker properties)
+      (org-with-point-at marker
+        (dolist (kv properties)
+          (org-entry-put (point) (car kv) (cdr kv)))))
+    marker))
 
 (defun cl::capture-fill-template (entry title)
   "Return a copy of capture ENTRY ready for non-interactive use with TITLE.
@@ -430,7 +433,7 @@ The prompt is extended with \", +N from now\" to advertise the syntax."
 
 ;;; Task picker
 
-(defun cl:read-task (&optional prompt break-only expand-state)
+(defun cl:read-task (&optional prompt break-only expand-state break-state)
   "Interactively select an org task; return its marker or nil on cancel.
 Candidates: current context, recent clock history, today's agenda.
 
@@ -440,6 +443,10 @@ BREAK-ONLY, when non-nil, opens the picker with the break filter active so
 only headings carrying a BREAK property are shown.
 EXPAND-STATE, when a one-element list, is updated in place with the current
 expand state (t = full agenda shown) so a live prompt overlay can reflect it.
+BREAK-STATE, when a one-element list, has its car set to the break-filter
+state (t = break filter active) in effect when a result is committed, so
+callers can tell whether a freshly typed title (a new task) was entered
+while browsing breaks.
 
 Key bindings inside the picker:
   <      toggle full candidate list
@@ -486,6 +493,7 @@ Key bindings inside the picker:
                          fprompt cands nil nil nil nil (caar cands)))
                     (quit (unless repeat (signal 'quit nil)))))))
           (when result
+            (when break-state (setcar break-state breaks))
             (throw 'done (or (cdr (assoc result cands #'string=)) result))))))))
 
 (defun cl::all-task-markers (match &optional markers break-only)
@@ -575,32 +583,35 @@ C-g at the duration prompt returns to the task picker."
         (user-error "Can't clock another"))
     (let (done)
       (while (not done)
-        (when-let*
-            ((marker (cl:read-task prompt))
-             (confirmed (or (markerp marker)
-                            (ignore-error quit
-                              (y-or-n-p "Create new task?")))))
-          (let* ((title        (if (markerp marker)
-                                   (cl::heading-at marker)
-                                 marker))
-                 (break-p      (and (markerp marker)
-                                    (cl::marker-is-break-p marker)))
-                 (default-mins (or (and (markerp marker)
-                                        (cl::effort-minutes marker))
-                                   (if break-p cl:default-break
-                                     cl:default-duration)))
-                 (mins         (ignore-error quit
-                                 (cl::read-minutes
-                                  (format "Work on \"%s\" for" title)
-                                  default-mins))))
-            (when mins
-              (setq marker (if (markerp marker)
-                               (copy-marker marker)
-                             (cl::capture-org-task title)))
-              (when switch
-                (cl::org-clock-out nil t))
-              (cl::begin-session title (copy-marker marker) mins)
-              (setq done t))))))))
+        (let ((break-state (list nil)))
+          (when-let*
+              ((marker (cl:read-task prompt nil nil break-state))
+               (confirmed (or (markerp marker)
+                              (ignore-error quit
+                                (y-or-n-p "Create new task?")))))
+            (let* ((title        (if (markerp marker)
+                                     (cl::heading-at marker)
+                                   marker))
+                   (break-p      (if (markerp marker)
+                                     (cl::marker-is-break-p marker)
+                                   (car break-state)))
+                   (default-mins (or (and (markerp marker)
+                                          (cl::effort-minutes marker))
+                                     (if break-p cl:default-break
+                                       cl:default-duration)))
+                   (mins         (ignore-error quit
+                                   (cl::read-minutes
+                                    (format "Work on \"%s\" for" title)
+                                    default-mins))))
+              (when mins
+                (setq marker (if (markerp marker)
+                                 (copy-marker marker)
+                               (cl::capture-org-task
+                                title (and break-p '(("BREAK" . "t"))))))
+                (when switch
+                  (cl::org-clock-out nil t))
+                (cl::begin-session title (copy-marker marker) mins)
+                (setq done t)))))))))
 
 (defun cl:switch-task ()
   "Select a new task then clock out of current and clock in.
@@ -687,17 +698,19 @@ candidate list is currently shown; updated in place for the live prompt.
 PROTECT-SECONDS is the keystroke suppression window (seconds) for the
 very first call to the task picker; nil or zero disables it.
 
-Returns a plist (:marker M :keep K :duration D) where:
+Returns a plist (:marker M :keep K :duration D :break-p B) where:
   :marker   — task to clock into (a marker), or nil (stay locked, no new session)
   :keep     — minutes of the old session to retain, or \\='all (keep everything)
   :duration — minutes for the new session, or nil (no new session, stay locked)
+  :break-p  — break-filter state in effect when :marker was committed; used
+              to tag a freshly typed title (a new task) with a BREAK property
 
 Special case: when :marker equals PREV-MARKER and :keep is \\='all, the old
 session is resumed for :duration minutes without clocking out.
 
 C-g at any sub-prompt (keep-minutes, duration) returns to the task picker.
 The function loops until the user commits a fully resolved choice."
-  (let (result)
+  (let (result (break-state (list break-p)))
     (while (null result)
       (let* ((keep-all nil)
              (marker
@@ -728,7 +741,7 @@ The function loops until the user commits a fully resolved choice."
                                         (interactive)
                                         (setq keep-all t)
                                         (abort-recursive-edit))))
-                      (cl:read-task nil break-p expand-state))))
+                      (cl:read-task nil break-p expand-state break-state))))
                 (quit nil))))
         ;; Protection only applies on the first invocation of the picker
         (setq protect-seconds nil)
@@ -774,7 +787,8 @@ The function loops until the user commits a fully resolved choice."
                           (if break-p cl:default-break cl:default-duration))))))
             (if silent-resume-p
                 (setq result (list :marker marker :keep 'all
-                                   :duration (round (/ remaining 60))))
+                                   :duration (round (/ remaining 60))
+                                   :break-p (car break-state)))
               (let* ((base (max 0 (round
                                    (/ (float-time
                                        (time-subtract (current-time) boundary))
@@ -792,7 +806,8 @@ The function loops until the user commits a fully resolved choice."
                             ;; Clock-out
                             (list :marker nil :keep mins :duration nil)
                           (list :marker marker :keep base
-                                :duration (if same-p (- mins base) mins))))))))))))
+                                :duration (if same-p (- mins base) mins)
+                                :break-p (car break-state))))))))))))
     result))
 
 (defun cl::interrupt-prompt ()
@@ -857,7 +872,8 @@ user's fully committed choice.  Dispatches the result:
                       (new-marker (if (markerp marker)
                                       (copy-marker marker)
                                     (cl::capture-org-task
-                                     title (and break-p '(("BREAK" . "t")))))))
+                                     title (and (plist-get choice :break-p)
+                                                '(("BREAK" . "t")))))))
                  (cl::begin-session title new-marker duration))))))))))
 
 ;;; Org-clock integration
