@@ -6,7 +6,9 @@
 
 (require 'org)
 (require 'org-clock)
+(require 'org-agenda)
 (require 'cl-lib)
+(require 'seq)
 (require 'minibuf-ext)
 
 ;;; Customization
@@ -47,16 +49,6 @@ integer: seconds of silence before warning (no grace period)."
 (defcustom cl:log-min-gap-minutes 10
   "Minimum gap between sessions in minutes before a gap line is shown in the log."
   :type 'natnum)
-
-(defcustom cl:clock-report-params
-  '(
-    :name "clocktable"
-    :scope agenda
-    :maxlevel 3
-    :link nil
-    :block today)
-  "The parameters to create the clock report"
-  :type 'list)
 
 (defcustom cl:prompt-protect-seconds 1
   "Keystroke suppression window in seconds when the interrupt prompt appears.
@@ -123,20 +115,24 @@ same retroactive clock-out options as for keyboard idle."
 
 ;;; Keymaps ──
 
-(defvar cl:buffer-map
+(defvar cl::agenda-map
   (let ((m (make-sparse-keymap)))
-    (define-key m [remap save-buffer]   #'ignore)
+    (define-key m [remap save-buffer] #'ignore)
     (define-key m (kbd "t")   #'cl:new-session)
-    (define-key m (kbd "TAB") #'cl::tab-toggle)
+    (define-key m (kbd "TAB") #'cl::log-toggle-day)
+    (define-key m (kbd "g")   #'cl::agenda-redo)
+    (define-key m (kbd "r")   #'cl::agenda-redo)
     m)
-  "Keymap for the org-clock-lock lock screen buffer.")
+  "Keymap layered over `org-agenda-mode-map' in the lock screen buffer.
+Shadows the agenda's own \"t\"/\"TAB\" bindings, since in this buffer
+they pick a task and toggle the day log instead.")
 
-(defun cl::tab-toggle ()
-  "TAB on the report header toggles the clock report; anywhere else toggles the day log."
-  (interactive)
-  (if (get-text-property (point) 'cl::report-header)
-      (cl::toggle-report)
-    (cl::log-toggle-day)))
+(define-minor-mode cl::agenda-lock-minor-mode
+  "Provide org-clock-lock bindings in the agenda-based lock buffer.
+Purely internal: turned on by `org-clock-lock--agenda-finalize' every
+time the lock buffer is (re)rendered, since `org-agenda-mode' resets
+buffer-local minor modes on each redo."
+  :keymap cl::agenda-map)
 
 (defvar cl:mode-map
   (let ((m (make-sparse-keymap)))
@@ -156,7 +152,9 @@ same retroactive clock-out options as for keyboard idle."
                    find-alternate-file
                    split-window-below split-window-right
                    delete-window delete-other-windows
-                   eval-last-sexp eval-buffer eval-region))
+                   eval-last-sexp eval-buffer eval-region
+                   org-agenda-quit org-agenda-Quit org-agenda-exit
+                   org-agenda-kill-all-agenda-buffers))
       (define-key map (vector 'remap cmd) #'cl:blocked))
     (dolist (key '("C-h" "C-x 5" "C-x 4" "C-x t" "C-c p"))
       (define-key map (kbd key) #'cl:blocked))
@@ -206,14 +204,15 @@ can read session data such as title, marker, and planned minutes.")
 (defconst cl::buf " *org-clock-lock*"
   "Name of the full-frame lock buffer.")
 
-(defconst cl::log-marker ";;log-start;;"
-  "Invisible string marking the insertion point for log entries.")
+(defvar cl::log-entries nil
+  "List of completed session plists, oldest first.
+Each entry is (:title :break-p :start :end :spent :planned :marker :date).
+This is the log's sole source of truth: the lock buffer is an
+`org-agenda' buffer, fully rebuilt on every redo/relock, so nothing
+about the log can live in buffer text between renders.")
 
-(defconst cl::report-marker-start ";;report-start;;"
-  "Invisible string marking the start of the clock report region.")
-
-(defconst cl::report-marker-end ";;report-end;;"
-  "Invisible string marking the end of the clock report region.")
+(defvar cl::log-collapsed-days nil
+  "List of date strings (YYYY-MM-DD) whose log block renders collapsed.")
 
 
 
@@ -1006,101 +1005,6 @@ Also end current session, unless KEEP-STATE is non-nil."
        (eq (marker-buffer m1) (marker-buffer m2))
        (= (marker-position m1) (marker-position m2))))
 
-;;; Rendering ─
-
-(defun cl::generate-clock-report ()
-  "Return today's org clock report as a string.
-Inserts a clocktable dblock into a temporary org buffer, renders it via
-`org-update-dblock', and returns the table text without the #+BEGIN/#+END
-wrapper.  Returns an empty string if no clock data exists for today."
-  (cl-block nil
-    (with-temp-buffer
-      (org-mode)
-      (goto-char (point-min))
-      (condition-case err
-          (let* ((name (plist-get cl:clock-report-params :name))
-                 (cmd (intern (concat "org-dblock-write:" name))))
-            (funcall cmd cl:clock-report-params))
-        (error
-         (message "org-clock-lock: clock report error: %s"
-                  (error-message-string err))
-         (cl-return "")))
-      (goto-char (point-min))
-      (let ((start (point)))
-        (goto-char (point-max))
-        (string-trim-right
-         (buffer-substring-no-properties start (point)))))))
-
-(defun cl::update-clock-report ()
-  "Replace the clock report region in the lock screen buffer with fresh data.
-Called every time the lock screen is shown so the table is always current.
-Preserves the current collapsed/expanded state of the report section.
-Does nothing if the buffer does not exist or the markers are missing."
-  (when-let* ((buf (get-buffer cl::buf)))
-    (with-current-buffer buf
-      (let ((inhibit-read-only t)
-            (collapsed-p (and (listp buffer-invisibility-spec)
-                              (member 'org-clock-lock--report buffer-invisibility-spec))))
-        (save-excursion
-          (goto-char (point-min))
-          (when (search-forward cl::report-marker-start nil t)
-            ;; Update the header line arrow to match current state.
-            (save-excursion
-              (goto-char (line-beginning-position 0))
-              (when (get-text-property (point) 'cl::report-header)
-                (let ((new-header (cl::report-make-header collapsed-p)))
-                  (delete-region (point) (line-beginning-position 2))
-                  (insert new-header))))
-            (forward-line 1)
-            (let ((content-start (point)))
-              (when (search-forward cl::report-marker-end nil t)
-                (beginning-of-line)
-                (delete-region content-start (point))
-                (let ((report (cl::generate-clock-report)))
-                  (unless (string-empty-p report)
-                    (let ((start (point)))
-                      (insert report "\n")
-                      (let ((end (point)))
-                        (add-text-properties start end
-                                             (list 'invisible 'org-clock-lock--report))))))))))))))
-
-(defun cl::report-make-header (&optional collapsed-p)
-  "Return a propertized header line for the clock report section."
-  (let* ((arrow (if collapsed-p "▶" "▼"))
-         (label (format " Clock report %s " arrow))
-         (pad   62)
-         (core  (length label))
-         (left  (max 2 (/ (- pad core) 2)))
-         (right (max 2 (- pad core left)))
-         (line  (concat
-                 (propertize (concat "  " (make-string left ?─)) 'face 'shadow)
-                 (propertize label                               'face 'shadow)
-                 (propertize (concat (make-string right ?─) "\n") 'face 'shadow))))
-    (add-text-properties 0 (length line)
-                         (list 'cl::report-header t)
-                         line)
-    line))
-
-(defun cl::toggle-report ()
-  "Toggle collapse/expand of the clock report section."
-  (interactive)
-  (with-current-buffer (get-buffer-create cl::buf)
-    (let ((inhibit-read-only t))
-      (if (and (listp buffer-invisibility-spec)
-               (member 'org-clock-lock--report buffer-invisibility-spec))
-          (setq buffer-invisibility-spec
-                (remove 'org-clock-lock--report buffer-invisibility-spec))
-        (add-to-invisibility-spec 'org-clock-lock--report))
-      (let* ((collapsed-p (and (listp buffer-invisibility-spec)
-                               (member 'org-clock-lock--report buffer-invisibility-spec))))
-        (save-excursion
-          (goto-char (point-min))
-          (when (search-forward cl::report-marker-start nil t)
-            (goto-char (line-beginning-position 0))
-            (when (get-text-property (point) 'cl::report-header)
-              (delete-region (point) (line-beginning-position 2))
-              (insert (cl::report-make-header collapsed-p)))))))))
-
 ;;; Log rendering ─────────────────────────────────────────────────────────────
 ;;
 ;; Layout (newest at top within each day):
@@ -1111,53 +1015,34 @@ Does nothing if the buffer does not exist or the markers are missing."
 ;;   HH:MM–HH:MM  Title                    H:MM
 ;;   ── Fri 16 May ▶  H:MM spent · H:MM planned ──   (prev-day, collapsed)
 ;;
-;; Text properties drive all logic; no separate data structure is maintained.
-;; Session lines store only: cl::entry, cl::date, cl::end, cl::spent, cl::marker.
-;; The cumulative annotation carries cl::annot so it can be deleted in place
-;; without rewriting the whole line.
-;;
-;; Every session and gap line carries 'invisible set to (cl::log-day-sym date)
-;; at construction time.  The sym is absent from buffer-invisibility-spec while
-;; the day is expanded; adding it collapses the block without touching the text.
-;; Header and footer lines are never marked invisible — they are the toggle
-;; targets and must always be reachable by TAB.
+;; `cl::log-entries' is the sole source of truth (the lock buffer is an
+;; org-agenda buffer, erased and rebuilt on every redo/relock, so nothing can
+;; live in buffer text between renders).  `cl::log-render' rebuilds the whole
+;; block from it on every call; `cl::log-collapsed-days' says which days to
+;; render without their body lines.  Every rendered line still carries the
+;; `cl::log-line' property so `cl::log-bounds' can find and replace just this
+;; block inside the larger agenda buffer.
 
 (defconst cl::log-title-width 36
   "Display columns reserved for the task title in log lines.")
-
-(defsubst cl::log-day-sym (date)
-  "Invisibility symbol for DATE's collapsed log block (today or a past day)."
-  (intern (format "org-clock-lock--day-%s" date)))
 
 (defun cl::log-fmt-day-label (date)
   "Format DATE (YYYY-MM-DD) as e.g. \"Fri 16 May\"."
   (format-time-string "%a %e %b" (date-to-time (concat date " 00:00:00"))))
 
-(defun cl::log-region ()
-  "Return (START . END) of the log entry area in the current buffer, or nil."
-  (save-excursion
-    (goto-char (point-min))
-    (when-let* ((s (and (search-forward cl::log-marker nil t)
-                        (progn (forward-line 1) (point))))
-                (e (and (search-forward cl::report-marker-start nil t)
-                        (line-beginning-position 1))))
-      (cons s e))))
-
 ;;; Line constructors ──────────────────────────────────────────────────────────
 
-(defun cl::log-make-session-line (start end title break-p spent planned marker cumul date)
+(defun cl::log-make-session-line (start end title break-p spent planned cumul date)
   "Return a propertized log line for a completed session.
 START and END are time values for the session's clock-in and clock-out times.
 TITLE is the task heading string.
 BREAK-P is non-nil when this was a break session (adds a ☕ icon).
 SPENT is the number of minutes actually clocked in this session.
 PLANNED is the number of minutes originally scheduled for this session.
-MARKER is the org marker for the task; stored as a text property for later use.
-CUMUL is the total minutes clocked on this task today across all sessions;
-when CUMUL > SPENT an annotation showing the cumulative total is appended and
-tagged with `cl::annot t' so only that span needs deleting when a later
-session for the same task arrives.
-DATE is the session date string (YYYY-MM-DD), used for the invisibility symbol."
+CUMUL is the total minutes clocked on this task up to and including this
+session; when CUMUL > SPENT an annotation showing the cumulative total is
+appended.
+DATE is the session date string (YYYY-MM-DD)."
   (let* ((tr    (format "%s–%s"
                         (format-time-string "%H:%M" start)
                         (format-time-string "%H:%M" end)))
@@ -1175,22 +1060,16 @@ DATE is the session date string (YYYY-MM-DD), used for the invisibility symbol."
                         dur))
          (annot (when (> cumul spent)
                   (propertize (format "  (%s on task)" (cl::fmt-hh-mm cumul))
-                              'cl::annot t 'face 'shadow)))
+                              'face 'shadow)))
          (line  (concat base (or annot "") "\n")))
     (add-text-properties 0 (length line)
-                         (list 'cl::entry  t
-                               'cl::date   date
-                               'cl::end    end
-                               'cl::spent  spent
-                               'cl::marker marker
-                               'invisible  (cl::log-day-sym date))
+                         (list 'cl::log-line t 'cl::date date)
                          line)
     line))
 
 (defun cl::log-make-gap-line (minutes date)
   "Return a propertized gap indicator line for MINUTES of unaccounted time.
-DATE is the date string (YYYY-MM-DD) of the surrounding sessions; used to
-attach the correct invisibility symbol so the gap collapses with its day."
+DATE is the date string (YYYY-MM-DD) of the surrounding sessions."
   (let* ((label (format " %d min " minutes))
          (pad   58)
          (left  (max 4 (/ (- pad (length label)) 2)))
@@ -1198,8 +1077,7 @@ attach the correct invisibility symbol so the gap collapses with its day."
          (line  (concat "  " (make-string left ?·)
                         label (make-string right ?·) "\n")))
     (add-text-properties 0 (length line)
-                         (list 'cl::gap t 'cl::date date 'face 'shadow
-                               'invisible (cl::log-day-sym date))
+                         (list 'cl::log-line t 'cl::date date 'face 'shadow)
                          line)
     line))
 
@@ -1229,10 +1107,7 @@ SPENT and PLANNED are minute counts for the day so far.
 COLLAPSED-P controls the ▶/▼ arrow shown next to \"today\"."
   (let ((line (cl::log-make-ruler "today" spent planned collapsed-p)))
     (add-text-properties 0 (length line)
-                         (list 'cl::footer     t
-                               'cl::date        date
-                               'cl::day-spent   spent
-                               'cl::day-planned planned)
+                         (list 'cl::log-line t 'cl::date date)
                          line)
     line))
 
@@ -1243,127 +1118,93 @@ SPENT and PLANNED are minute totals for that day.
 COLLAPSED-P controls the ▶/▼ arrow shown next to the day label."
   (let ((line (cl::log-make-ruler (cl::log-fmt-day-label date) spent planned collapsed-p)))
     (add-text-properties 0 (length line)
-                         (list 'cl::header     t
-                               'cl::date        date
-                               'cl::day-spent   spent
-                               'cl::day-planned planned)
+                         (list 'cl::log-line t 'cl::date date)
                          line)
     line))
 
 ;;; Log operations ─────────────────────────────────────────────────────────────
 
-(defun cl::log-for-each-entry (region marker date fn)
-  "Call FN at the start of each session entry matching MARKER and DATE in REGION.
-REGION is a cons (START . END) of buffer positions delimiting the log area.
-MARKER is the org marker whose entries should be visited.
-DATE is the date string (YYYY-MM-DD) to filter by.
-FN is called with point at the beginning of each matching line.
-The caller is responsible for binding `inhibit-read-only' if FN modifies
-the buffer."
-  (save-excursion
-    (goto-char (car region))
-    (while (< (point) (cdr region))
-      (when (and (get-text-property (point) 'cl::entry)
-                 (equal (get-text-property (point) 'cl::date) date)
-                 (cl::markers-equal-p (get-text-property (point) 'cl::marker) marker))
-        (funcall fn))
-      (forward-line 1))))
+(defun cl::log-render-day (entries date)
+  "Render one day's session/gap lines, newest first.
+ENTRIES are that DATE's plists from `cl::log-entries', newest first.
+The cumulative-on-task annotation for each line sums that entry and every
+older same-marker entry in ENTRIES; gaps are the time between one entry's
+start and the next (older) entry's end."
+  (apply #'concat
+         (cl-loop for (e . older) on entries
+                  for cumul = (cl-reduce
+                               #'+ (cons e older) :initial-value 0
+                               :key (lambda (x)
+                                      (if (cl::markers-equal-p
+                                           (plist-get x :marker) (plist-get e :marker))
+                                          (plist-get x :spent) 0)))
+                  collect (cl::log-make-session-line
+                           (plist-get e :start) (plist-get e :end)
+                           (plist-get e :title) (plist-get e :break-p)
+                           (plist-get e :spent) (plist-get e :planned)
+                           cumul date)
+                  when older
+                  collect (let ((gap (max 0 (round
+                                              (/ (float-time
+                                                  (time-subtract (plist-get e :start)
+                                                                 (plist-get (car older) :end)))
+                                                 60)))))
+                            (if (>= gap cl:log-min-gap-minutes)
+                                (cl::log-make-gap-line gap date)
+                              "")))))
 
-(defun cl::log-cumulative-spent (region marker date)
-  "Sum `cl::spent' minutes for MARKER on DATE across all entries in REGION."
-  (let ((total 0))
-    (cl::log-for-each-entry region marker date
-      (lambda ()
-        (cl-incf total (or (get-text-property (point) 'cl::spent) 0))))
-    total))
+(defun cl::log-render ()
+  "Return the full rendered log section, most recent day first.
+Always includes today, even with no sessions logged yet."
+  (let* ((today   (format-time-string "%Y-%m-%d"))
+         (by-date (seq-group-by (lambda (e) (plist-get e :date)) cl::log-entries))
+         (dates   (sort (cl-adjoin today (mapcar #'car by-date) :test #'equal)
+                        #'string>)))
+    (mapconcat
+     (lambda (date)
+       (let* ((entries (sort (copy-sequence (alist-get date by-date nil nil #'equal))
+                              (lambda (a b) (time-less-p (plist-get b :start)
+                                                         (plist-get a :start)))))
+              (spent   (cl-reduce #'+ entries :initial-value 0
+                                   :key (lambda (e) (plist-get e :spent))))
+              (planned (cl-reduce #'+ entries :initial-value 0
+                                   :key (lambda (e) (plist-get e :planned))))
+              (collapsed-p (and (member date cl::log-collapsed-days) t)))
+         (concat (if (equal date today)
+                     (cl::log-make-footer-line date spent planned collapsed-p)
+                   (cl::log-make-header-line date spent planned collapsed-p))
+                 (unless collapsed-p (cl::log-render-day entries date)))))
+     dates "")))
 
-(defun cl::log-strip-annot (region marker date)
-  "Delete the `cl::annot' span from same-task entries for DATE in REGION.
-Targets only the annotation text, leaving the rest of each line intact."
-  (cl::log-for-each-entry region marker date
-    (lambda ()
-      (when-let* ((as (text-property-any (point) (line-end-position) 'cl::annot t)))
-        (delete-region as (line-end-position))))))
+(defun cl::log-bounds ()
+  "Return (START . END) of the rendered log block, or nil if absent."
+  (when-let* ((start (text-property-any (point-min) (point-max) 'cl::log-line t)))
+    (cons start (or (text-property-not-all start (point-max) 'cl::log-line t)
+                    (point-max)))))
 
-(defun cl::log-finalise-day (date spent planned)
-  "Collapse today's top-of-log block into a previous-day header.
-Replaces the today-footer with a dated header and adds the day's
-invisibility symbol to `buffer-invisibility-spec'.  Body lines (entries,
-gaps) already carry the matching `invisible' text property from
-construction, so no per-line pass is needed.
-Caller must hold `inhibit-read-only'."
-  (let ((sym (cl::log-day-sym date)))
-    (goto-char (car (cl::log-region)))
-    (delete-region (point) (line-beginning-position 2))
-    (insert (cl::log-make-header-line date spent planned t))
-    (add-to-invisibility-spec sym)))
+(defun cl::redraw-log ()
+  "Regenerate the log block from `cl::log-entries' in place."
+  (when-let* ((bounds (cl::log-bounds)))
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (delete-region (car bounds) (cdr bounds))
+        (goto-char (car bounds))
+        (insert (cl::log-render))))))
 
 (defun cl::log-toggle-day ()
-  "Toggle collapse/expand of the day's log block at point.
-Works for both today (cl::footer) and past days (cl::header).
-If point is in invisible text (i.e. inside a collapsed day's session
-lines), searches backward to the visible footer/header line that owns
-the block, since the controlling line is always above its children."
+  "Toggle collapse/expand of the log day-block at point."
   (interactive)
-  (let ((pos (if (invisible-p (point))
-                 (let ((p (point)))
-                   (while (and (> p (point-min)) (invisible-p p))
-                     (setq p (previous-single-char-property-change p 'invisible)))
-                   p)
-               (point))))
-    (when-let* ((date (get-text-property pos 'cl::date))
-                (sym  (cl::log-day-sym date)))
-    (let ((inhibit-read-only t))
-      (if (and (listp buffer-invisibility-spec) (member sym buffer-invisibility-spec))
-          (setq buffer-invisibility-spec (remove sym buffer-invisibility-spec))
-        (add-to-invisibility-spec sym))
-      (let ((collapsed-p (and (listp buffer-invisibility-spec)
-                              (member sym buffer-invisibility-spec)))
-            (region (cl::log-region)))
-        (save-excursion
-          (goto-char (car region))
-          (while (< (point) (cdr region))
-            (cond
-             ((and (get-text-property (point) 'cl::header)
-                   (equal (get-text-property (point) 'cl::date) date))
-              (let ((sp (get-text-property (point) 'cl::day-spent))
-                    (pl (get-text-property (point) 'cl::day-planned)))
-                (delete-region (point) (line-beginning-position 2))
-                (insert (cl::log-make-header-line date sp pl collapsed-p))
-                (goto-char (cdr (cl::log-region)))))   ; exit loop
-             ((and (get-text-property (point) 'cl::footer)
-                   (equal (get-text-property (point) 'cl::date) date))
-              (let ((sp (get-text-property (point) 'cl::day-spent))
-                    (pl (get-text-property (point) 'cl::day-planned)))
-                (delete-region (point) (line-beginning-position 2))
-                (insert (cl::log-make-footer-line date sp pl collapsed-p))
-                (goto-char (cdr (cl::log-region)))))   ; exit loop
-             (t (forward-line 1))))))))))
-
-
-(defun cl:ui-render-lock-screen ()
-  "Insert the lock screen skeleton into the current buffer."
-  (insert "\n EMACS IS LOCKED\n\n")
-  (insert
-   (substitute-command-keys
-    (concat
-     "\\<org-clock-lock-buffer-map>"
-     "  \\[org-clock-lock-new-session]  Pick a task (C-c b inside to filter breaks)\n"
-     (if (where-is-internal 'cl:mode cl:buffer-map)
-         "  \\[org-clock-lock-mode]  Disable org-clock-lock\n"
-       ""))))
-  (insert "\n")
-  (insert (propertize (concat cl::log-marker "\n") 'invisible t))
-  (insert "  No sessions yet today.\n")
-  (insert "\n\n")
-  ;; Clock report region — header then invisible markers wrapping content
-  (insert (cl::report-make-header))
-  (insert (propertize (concat cl::report-marker-start "\n") 'invisible t))
-  (insert (propertize (concat cl::report-marker-end "\n") 'invisible t)))
+  (when-let* ((date (get-text-property (point) 'cl::date)))
+    (if (member date cl::log-collapsed-days)
+        (setq cl::log-collapsed-days (delete date cl::log-collapsed-days))
+      (push date cl::log-collapsed-days))
+    (cl::redraw-log)))
 
 (defun cl:ui--log-session-entry ()
-  "Append the completed session to the lock screen log."
-  (when-let* ((buf (and cl::session (cl::ensure-lock-buffer))))
+  "Record the just-completed session in `cl::log-entries'.
+Also collapses any day that is no longer today, mirroring the log's old
+auto-collapse-on-rollover behaviour."
+  (when cl::session
     (let* ((marker  (cl::session-marker         cl::session))
            (break-p (cl::session-break-p         cl::session))
            (title   (cl::session-title           cl::session))
@@ -1372,60 +1213,14 @@ the block, since the controlling line is always above its children."
            (start   org-clock-start-time)
            (spent   (max 0 (round (org-time-convert-to-integer
                                    (time-subtract end start)) 60)))
-           (date    (format-time-string "%Y-%m-%d")))
+           (date    (format-time-string "%Y-%m-%d" start))
+           (today   (format-time-string "%Y-%m-%d")))
       (unless (<= spent 0)
-        (with-current-buffer buf
-          (let ((inhibit-read-only t))
-            (save-excursion
-              (goto-char (point-min))
-              (when (search-forward "  No sessions yet today.\n" nil t)
-                (replace-match "")))
-            (let* ((region   (cl::log-region))
-                   (top      (car region))
-                   (top-date (get-text-property top 'cl::date)))
-              (cond
-               ;; ── Today's footer is at top: update totals and prepend ──────
-               ((equal top-date date)
-                (let* ((old-sp   (get-text-property top 'cl::day-spent))
-                       (old-pl   (get-text-property top 'cl::day-planned))
-                       ;; The entry on the line just below the footer is the
-                       ;; most recent session; its end time gives us the gap.
-                       (prev-end (save-excursion
-                                   (goto-char top) (forward-line 1)
-                                   (get-text-property (point) 'cl::end)))
-                       (gap     (when prev-end
-                                  (max 0 (round (/ (- (float-time start)
-                                                      (float-time prev-end))
-                                                   60)))))
-                       (cumul   (cl::log-cumulative-spent region marker date))
-                       ;; Preserve the user's current collapse state when
-                       ;; redrawing the footer after each new session.
-                       (collapsed-p (and (listp buffer-invisibility-spec)
-                                         (member (cl::log-day-sym date)
-                                                 buffer-invisibility-spec))))
-                  (cl::log-strip-annot region marker date)
-                  (goto-char top)
-                  (delete-region (point) (line-beginning-position 2))
-                  (insert (cl::log-make-footer-line date (+ old-sp spent)
-                                                    (+ old-pl planned) collapsed-p))
-                  (insert (cl::log-make-session-line
-                           start end title break-p spent
-                           planned marker (+ cumul spent) date))
-                  (when (and gap (>= gap cl:log-min-gap-minutes))
-                    (insert (cl::log-make-gap-line gap date)))))
-
-               ;; ── Different day or empty: collapse previous, open today ────
-               (t
-                (when (get-text-property top 'cl::footer)
-                  (cl::log-finalise-day
-                   top-date
-                   (get-text-property top 'cl::day-spent)
-                   (get-text-property top 'cl::day-planned)))
-                (goto-char (car (cl::log-region)))
-                (insert (cl::log-make-footer-line date spent planned))
-                (insert (cl::log-make-session-line
-                         start end title break-p spent planned
-                         marker spent date)))))))))))
+        (push (list :title title :break-p break-p :start start :end end
+                    :spent spent :planned planned :marker marker :date date)
+              cl::log-entries)
+        (unless (equal date today)
+          (cl-pushnew date cl::log-collapsed-days :test #'equal))))))
 
 
 (defun cl:ui-status-strings ()
@@ -1465,31 +1260,64 @@ is pending; the time is shown in warning face."
 
 ;;; Lock screen buffer
 
+(defun cl::agenda-redo ()
+  "Rebuild the lock-screen agenda, log, and clock report from scratch.
+Bound over the agenda's own `org-agenda-redo'/`org-agenda-redo-all',
+which rename the buffer away from `cl::buf' and drop
+`org-agenda-clockreport-mode' for a plain (non-sticky) agenda buffer
+like this one."
+  (interactive)
+  (cl::refresh-lock-buffer))
+
+(defun cl::agenda-finalize ()
+  "Append the org-clock-lock preamble and day log to the lock buffer.
+Runs on `org-agenda-finalize-hook', i.e. on every (re)generation of the
+lock buffer, since `org-agenda-mode' erases and rebuilds it from
+scratch each time."
+  (when (equal (buffer-name) cl::buf)
+    (goto-char (point-min))
+    (insert
+     "\n EMACS IS LOCKED\n\n"
+     (substitute-command-keys
+      (concat
+       "\\<org-clock-lock--agenda-map>"
+       "  \\[org-clock-lock-new-session]  Pick a task (C-c b inside to filter breaks)\n"
+       (if (where-is-internal 'cl:mode cl::agenda-map)
+           "  \\[org-clock-lock-mode]  Disable org-clock-lock\n"
+         "")))
+     "\n")
+    (goto-char (point-max))
+    (insert "\n" (cl::log-render))
+    (cl::agenda-lock-minor-mode 1)))
+
+(defun cl::refresh-lock-buffer ()
+  "(Re)build the agenda-based lock buffer and return it.
+Builds today's agenda into `cl::buf' via `org-agenda-list', with the
+native clock report forced on; `cl::agenda-finalize' appends the
+org-clock-lock preamble and day log once the agenda content is in."
+  (let ((org-agenda-buffer-tmp-name cl::buf)
+        (org-agenda-start-with-clockreport-mode t)
+        (org-agenda-window-setup 'current-window)
+        (org-agenda-sticky nil))
+    (save-window-excursion
+      (org-agenda-list nil nil 'day)))
+  (get-buffer cl::buf))
+
 (defun cl::ensure-lock-buffer ()
-  "Return the lock screen buffer, creating and initialising it if necessary."
-  (or (get-buffer cl::buf)
-      (let ((b (get-buffer-create cl::buf)))
-        (with-current-buffer b
-          (setq buffer-invisibility-spec '(t))
-          (use-local-map cl:buffer-map)
-          (let ((inhibit-read-only t))
-            (cl:ui-render-lock-screen))
-          (setq buffer-read-only t)
-          (set-buffer-modified-p nil))
-        b)))
+  "Return the lock screen buffer, building it if necessary."
+  (or (get-buffer cl::buf) (cl::refresh-lock-buffer)))
 
 (defun cl::show-lock-screen ()
   "Save each lockable frame's window config and show the lock buffer.
-Creates and renders the buffer skeleton on first call; refreshes the
-clock report on every call so it reflects current clocking data.  See
-`cl::lockable-frame-p' for which frames are considered."
+Rebuilds the buffer on every call so agenda, log, and clock report all
+reflect current data.  See `cl::lockable-frame-p' for which frames are
+considered."
   (let ((frames (cl-remove-if-not #'cl::lockable-frame-p (frame-list))))
     (setq cl::saved-frame-wconfs
           (mapcar (lambda (f)
                     (cons f (with-selected-frame f (current-window-configuration))))
                   frames))
-    (let ((buf (cl::ensure-lock-buffer)))
-      (cl::update-clock-report)
+    (let ((buf (cl::refresh-lock-buffer)))
       (dolist (f frames)
         (with-selected-frame f
           (cl::apply-lock-layout buf))))))
@@ -1524,8 +1352,9 @@ clock report on every call so it reflects current clocking data.  See
 (define-minor-mode cl:mode
   "Block Emacs until you choose an org task, then protect your focus.
 
-LOCKED   Full-frame lock screen.  `cl:locked-map' blocks navigation and
-         buffer commands.  `cl:buffer-map' provides [t/b] action keys.
+LOCKED   Full-frame lock screen: an org-agenda buffer with the day log
+         and clock report appended.  `cl:locked-map' blocks navigation
+         and buffer commands; \"t\" picks a task, TAB toggles a day-log block.
 
 UNLOCKED Normal Emacs with optional header-line countdown.
          Break tasks (BREAK property) skip idle detection.
@@ -1554,6 +1383,7 @@ Startup: adopts a running org clock if one exists."
                 emulation-mode-map-alists))
         (add-hook 'org-clock-out-hook #'cl::on-clock-out)
         (add-hook 'org-clock-cancel-hook #'cl::on-clock-out)
+        (add-hook 'org-agenda-finalize-hook #'cl::agenda-finalize)
         (unless (cl::adopt-running-clock)
           (cl::end-session)))
     (setq emulation-mode-map-alists
@@ -1563,6 +1393,7 @@ Startup: adopts a running org clock if one exists."
                         emulation-mode-map-alists))
     (remove-hook 'org-clock-out-hook #'cl::on-clock-out)
     (remove-hook 'org-clock-cancel-hook #'cl::on-clock-out)
+    (remove-hook 'org-agenda-finalize-hook #'cl::agenda-finalize)
     (cl::cancel-timers)
     (cl::hide-lock-screen)
     (cl::remove-header)
