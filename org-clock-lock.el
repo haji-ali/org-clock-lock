@@ -118,14 +118,22 @@ same retroactive clock-out options as for keyboard idle."
 (defvar cl::agenda-map
   (let ((m (make-sparse-keymap)))
     (define-key m [remap save-buffer] #'ignore)
-    (define-key m (kbd "t")   #'cl:new-session)
-    (define-key m (kbd "TAB") #'cl::log-toggle-day)
-    (define-key m (kbd "g")   #'cl::agenda-redo)
-    (define-key m (kbd "r")   #'cl::agenda-redo)
+    (define-key m (kbd "t") #'cl:new-session)
+    (define-key m (kbd "g") #'cl::agenda-redo)
+    (define-key m (kbd "r") #'cl::agenda-redo)
     m)
   "Keymap layered over `org-agenda-mode-map' in the lock screen buffer.
-Shadows the agenda's own \"t\"/\"TAB\" bindings, since in this buffer
-they pick a task and toggle the day log instead.")
+Shadows the agenda's own \"t\", since in this buffer it picks a task
+instead of cycling a TODO state.")
+
+(defvar cl::log-line-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "TAB") #'cl::log-toggle-day)
+    m)
+  "Keymap attached to org-clock-lock log lines via the `keymap' text
+property, so TAB toggles a day's log block wherever
+`org-clock-lock-agenda-log-block' is used -- the lock screen or any
+other org-agenda buffer -- without shadowing TAB elsewhere.")
 
 (define-minor-mode cl::agenda-lock-minor-mode
   "Provide org-clock-lock bindings in the agenda-based lock buffer.
@@ -247,8 +255,8 @@ about the log can live in buffer text between renders.")
 
 (defun cl::apply-lock-layout (buf)
   "Run `cl:lock-layout-function' in the selected frame and switch to BUF."
-  (with-demoted-errors
-      (funcall cl:lock-layout-function))
+  (with-demoted-errors "org-clock-lock: lock layout error: %S"
+    (funcall cl:lock-layout-function))
   (switch-to-buffer buf t))
 
 (defun cl::lockable-frame-p (frame)
@@ -1063,7 +1071,7 @@ DATE is the session date string (YYYY-MM-DD)."
                               'face 'shadow)))
          (line  (concat base (or annot "") "\n")))
     (add-text-properties 0 (length line)
-                         (list 'cl::log-line t 'cl::date date)
+                         (list 'cl::log-line t 'cl::date date 'keymap cl::log-line-map)
                          line)
     line))
 
@@ -1077,7 +1085,8 @@ DATE is the date string (YYYY-MM-DD) of the surrounding sessions."
          (line  (concat "  " (make-string left ?·)
                         label (make-string right ?·) "\n")))
     (add-text-properties 0 (length line)
-                         (list 'cl::log-line t 'cl::date date 'face 'shadow)
+                         (list 'cl::log-line t 'cl::date date
+                               'face 'shadow 'keymap cl::log-line-map)
                          line)
     line))
 
@@ -1107,7 +1116,7 @@ SPENT and PLANNED are minute counts for the day so far.
 COLLAPSED-P controls the ▶/▼ arrow shown next to \"today\"."
   (let ((line (cl::log-make-ruler "today" spent planned collapsed-p)))
     (add-text-properties 0 (length line)
-                         (list 'cl::log-line t 'cl::date date)
+                         (list 'cl::log-line t 'cl::date date 'keymap cl::log-line-map)
                          line)
     line))
 
@@ -1118,7 +1127,7 @@ SPENT and PLANNED are minute totals for that day.
 COLLAPSED-P controls the ▶/▼ arrow shown next to the day label."
   (let ((line (cl::log-make-ruler (cl::log-fmt-day-label date) spent planned collapsed-p)))
     (add-text-properties 0 (length line)
-                         (list 'cl::log-line t 'cl::date date)
+                         (list 'cl::log-line t 'cl::date date 'keymap cl::log-line-map)
                          line)
     line))
 
@@ -1200,6 +1209,32 @@ Always includes today, even with no sessions logged yet."
       (push date cl::log-collapsed-days))
     (cl::redraw-log)))
 
+(defun cl:agenda-log-block (&optional _match)
+  "Org-agenda block showing org-clock-lock's day log of clocked sessions.
+Standalone, general-purpose, and independent of `org-clock-lock-mode':
+add it to your own `org-agenda-custom-commands' like any other block,
+e.g.
+
+  (\"c\" \"My day\" ((agenda \"\") (org-clock-lock-agenda-log-block)))
+
+or call it directly as its own agenda command.  TAB on any log line
+toggles that day's block; the binding is a `keymap' text property
+local to the log's lines, so it does not shadow TAB anywhere else in
+whatever agenda buffer this is embedded in."
+  (interactive)
+  (org-agenda-prepare "Clock log")
+  (let ((inhibit-read-only t))
+    (goto-char (point-max))
+    (insert (cl::log-render)))
+  (goto-char (point-min))
+  (or org-agenda-multi (org-agenda-fit-window-to-buffer))
+  (add-text-properties
+   (point-min) (point-max)
+   (list 'org-agenda-type 'org-clock-lock-log
+         'org-redo-cmd '(org-clock-lock-agenda-log-block)))
+  (org-agenda-finalize)
+  (unless org-agenda-multi (setq buffer-read-only t)))
+
 (defun cl:ui--log-session-entry ()
   "Record the just-completed session in `cl::log-entries'.
 Also collapses any day that is no longer today, mirroring the log's old
@@ -1260,17 +1295,34 @@ is pending; the time is shown in warning face."
 
 ;;; Lock screen buffer
 
+(defun cl::default-agenda-command ()
+  "Default `cl:agenda-command': today's plain `org-agenda-list'."
+  (org-agenda-list nil nil 'day))
+
+(defcustom cl:agenda-command #'cl::default-agenda-command
+  "Niladic function that builds/displays the agenda shown while locked.
+org-clock-lock has no opinion on what the lock screen looks like beyond
+that it is an org-agenda buffer: this is called with
+`org-agenda-buffer-tmp-name' bound to the lock buffer's name, so any
+`org-agenda' entry point works, e.g. a plain `org-agenda-list' (the
+default), or `(lambda () (org-agenda nil \"c\"))' to dispatch one of
+your own `org-agenda-custom-commands'.  Add
+`org-clock-lock-agenda-log-block' and/or `org-agenda-clockreport-mode'
+to that custom command yourself if you want the clocked-session log or
+a clock report in the lock screen."
+  :type 'function)
+
 (defun cl::agenda-redo ()
-  "Rebuild the lock-screen agenda, log, and clock report from scratch.
+  "Rebuild the lock-screen agenda from scratch via `cl:agenda-command'.
 Bound over the agenda's own `org-agenda-redo'/`org-agenda-redo-all',
-which rename the buffer away from `cl::buf' and drop
-`org-agenda-clockreport-mode' for a plain (non-sticky) agenda buffer
-like this one."
+which rename the buffer away from `cl::buf' and drop per-buffer agenda
+state (e.g. `org-agenda-clockreport-mode') for a plain (non-sticky)
+agenda buffer like this one."
   (interactive)
   (cl::refresh-lock-buffer))
 
 (defun cl::agenda-finalize ()
-  "Append the org-clock-lock preamble and day log to the lock buffer.
+  "Prepend the org-clock-lock preamble to the lock buffer.
 Runs on `org-agenda-finalize-hook', i.e. on every (re)generation of the
 lock buffer, since `org-agenda-mode' erases and rebuilds it from
 scratch each time."
@@ -1286,21 +1338,24 @@ scratch each time."
            "  \\[org-clock-lock-mode]  Disable org-clock-lock\n"
          "")))
      "\n")
-    (goto-char (point-max))
-    (insert "\n" (cl::log-render))
     (cl::agenda-lock-minor-mode 1)))
 
 (defun cl::refresh-lock-buffer ()
   "(Re)build the agenda-based lock buffer and return it.
-Builds today's agenda into `cl::buf' via `org-agenda-list', with the
-native clock report forced on; `cl::agenda-finalize' appends the
-org-clock-lock preamble and day log once the agenda content is in."
-  (let ((org-agenda-buffer-tmp-name cl::buf)
-        (org-agenda-start-with-clockreport-mode t)
+Calls `cl:agenda-command' with the buffer pinned to `cl::buf'.  Both
+`org-agenda-buffer-name' and `org-agenda-buffer-tmp-name' are bound:
+a single-command function (`org-agenda-list' and friends) reads
+`org-agenda-buffer-tmp-name' itself, but a genuine multi-block series
+command (`org-agenda-run-series') never does -- its own outer buffer
+setup just uses whatever `org-agenda-buffer-name' already is, so that
+needs pinning directly too.  `cl::agenda-finalize' then prepends the
+org-clock-lock preamble once the agenda content is in."
+  (let ((org-agenda-buffer-name cl::buf)
+        (org-agenda-buffer-tmp-name cl::buf)
         (org-agenda-window-setup 'current-window)
         (org-agenda-sticky nil))
     (save-window-excursion
-      (org-agenda-list nil nil 'day)))
+      (funcall cl:agenda-command)))
   (get-buffer cl::buf))
 
 (defun cl::ensure-lock-buffer ()
@@ -1309,8 +1364,8 @@ org-clock-lock preamble and day log once the agenda content is in."
 
 (defun cl::show-lock-screen ()
   "Save each lockable frame's window config and show the lock buffer.
-Rebuilds the buffer on every call so agenda, log, and clock report all
-reflect current data.  See `cl::lockable-frame-p' for which frames are
+Rebuilds the buffer on every call via `cl::refresh-lock-buffer' so it
+reflects current data.  See `cl::lockable-frame-p' for which frames are
 considered."
   (let ((frames (cl-remove-if-not #'cl::lockable-frame-p (frame-list))))
     (setq cl::saved-frame-wconfs
@@ -1352,9 +1407,11 @@ considered."
 (define-minor-mode cl:mode
   "Block Emacs until you choose an org task, then protect your focus.
 
-LOCKED   Full-frame lock screen: an org-agenda buffer with the day log
-         and clock report appended.  `cl:locked-map' blocks navigation
-         and buffer commands; \"t\" picks a task, TAB toggles a day-log block.
+LOCKED   Full-frame lock screen: an org-agenda buffer, built by
+         `cl:agenda-command' (customize it to add
+         `org-clock-lock-agenda-log-block' or a clock report).
+         `cl:locked-map' blocks navigation and buffer commands;
+         \"t\" picks a task.
 
 UNLOCKED Normal Emacs with optional header-line countdown.
          Break tasks (BREAK property) skip idle detection.
