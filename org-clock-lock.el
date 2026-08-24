@@ -1220,11 +1220,23 @@ e.g.
 or call it directly as its own agenda command.  TAB on any log line
 toggles that day's block; the binding is a `keymap' text property
 local to the log's lines, so it does not shadow TAB anywhere else in
-whatever agenda buffer this is embedded in."
+whatever agenda buffer this is embedded in.
+
+The block's header respects `org-agenda-overriding-header' like any
+other block, so a series entry can override it via its own settings,
+e.g.
+
+  (org-clock-lock-agenda-log-block
+   \"\" ((org-agenda-overriding-header \"Sessions\")))"
   (interactive)
   (org-agenda-prepare "Clock log")
   (let ((inhibit-read-only t))
     (goto-char (point-max))
+    (let ((s (point)))
+      (org-agenda--insert-overriding-header "Clock log:\n")
+      (when (> (point) s)
+        (add-text-properties s (1- (point)) (list 'face 'org-agenda-structure))
+        (org-agenda-mark-header-line s)))
     (insert (cl::log-render)))
   (goto-char (point-min))
   (or org-agenda-multi (org-agenda-fit-window-to-buffer))
