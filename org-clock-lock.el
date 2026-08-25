@@ -1040,6 +1040,15 @@ Also end current session, unless KEEP-STATE is non-nil."
 
 ;;; Line constructors ──────────────────────────────────────────────────────────
 
+(defun cl::log-make-line (line date)
+  "TODO"
+  (add-text-properties 0 (length line)
+                       (list 'cl::log-line t 'cl::date date
+                             'keymap cl::log-line-map
+                             'local-map cl::log-line-map)
+                       line)
+  line)
+
 (defun cl::log-make-session-line (start end title break-p spent planned cumul date)
   "Return a propertized log line for a completed session.
 START and END are time values for the session's clock-in and clock-out times.
@@ -1068,12 +1077,8 @@ DATE is the session date string (YYYY-MM-DD)."
                         dur))
          (annot (when (> cumul spent)
                   (propertize (format "  (%s on task)" (cl::fmt-hh-mm cumul))
-                              'face 'shadow)))
-         (line  (concat base (or annot "") "\n")))
-    (add-text-properties 0 (length line)
-                         (list 'cl::log-line t 'cl::date date 'keymap cl::log-line-map)
-                         line)
-    line))
+                              'face 'shadow))))
+    (cl::log-make-line (concat base (or annot "") "\n") date)))
 
 (defun cl::log-make-gap-line (minutes date)
   "Return a propertized gap indicator line for MINUTES of unaccounted time.
@@ -1083,10 +1088,10 @@ DATE is the date string (YYYY-MM-DD) of the surrounding sessions."
          (left  (max 4 (/ (- pad (length label)) 2)))
          (right (max 4 (- pad (length label) left)))
          (line  (concat "  " (make-string left ?·)
-                        label (make-string right ?·) "\n")))
+                        label (make-string right ?·) "\n"))
+         (line (cl::log-make-line line date)))
     (add-text-properties 0 (length line)
-                         (list 'cl::log-line t 'cl::date date
-                               'face 'shadow 'keymap cl::log-line-map)
+                         (list 'face 'shadow)
                          line)
     line))
 
@@ -1115,21 +1120,16 @@ DATE is the date string (YYYY-MM-DD) stored as a text property.
 SPENT and PLANNED are minute counts for the day so far.
 COLLAPSED-P controls the ▶/▼ arrow shown next to \"today\"."
   (let ((line (cl::log-make-ruler "today" spent planned collapsed-p)))
-    (add-text-properties 0 (length line)
-                         (list 'cl::log-line t 'cl::date date 'keymap cl::log-line-map)
-                         line)
-    line))
+    (cl::log-make-line line date)))
 
 (defun cl::log-make-header-line (date spent planned collapsed-p)
   "Return a propertized previous-day ruler line.
 DATE is the date string (YYYY-MM-DD), formatted as e.g. \"Fri 16 May\" in the label.
 SPENT and PLANNED are minute totals for that day.
 COLLAPSED-P controls the ▶/▼ arrow shown next to the day label."
-  (let ((line (cl::log-make-ruler (cl::log-fmt-day-label date) spent planned collapsed-p)))
-    (add-text-properties 0 (length line)
-                         (list 'cl::log-line t 'cl::date date 'keymap cl::log-line-map)
-                         line)
-    line))
+  (let ((line (cl::log-make-ruler (cl::log-fmt-day-label date)
+                                  spent planned collapsed-p)))
+    (cl::log-make-line line date)))
 
 ;;; Log operations ─────────────────────────────────────────────────────────────
 
@@ -1334,22 +1334,8 @@ agenda buffer like this one."
   (cl::refresh-lock-buffer))
 
 (defun cl::agenda-finalize ()
-  "Prepend the org-clock-lock preamble to the lock buffer.
-Runs on `org-agenda-finalize-hook', i.e. on every (re)generation of the
-lock buffer, since `org-agenda-mode' erases and rebuilds it from
-scratch each time."
+  "Finalized lock buffer."
   (when (equal (buffer-name) cl::buf)
-    (goto-char (point-min))
-    (insert
-     "\n EMACS IS LOCKED\n\n"
-     (substitute-command-keys
-      (concat
-       "\\<org-clock-lock--agenda-map>"
-       "  \\[org-clock-lock-new-session]  Pick a task (C-c b inside to filter breaks)\n"
-       (if (where-is-internal 'cl:mode cl::agenda-map)
-           "  \\[org-clock-lock-mode]  Disable org-clock-lock\n"
-         "")))
-     "\n")
     (cl::agenda-lock-minor-mode 1)))
 
 (defun cl::refresh-lock-buffer ()
