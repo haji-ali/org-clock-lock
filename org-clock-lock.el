@@ -129,11 +129,18 @@ instead of cycling a TODO state.")
 (defvar cl::log-line-map
   (let ((m (make-sparse-keymap)))
     (define-key m (kbd "TAB") #'cl::log-toggle-day)
+    (define-key m [tab] #'cl::log-toggle-day)
     m)
   "Keymap attached to org-clock-lock log lines via the `keymap' text
 property, so TAB toggles a day's log block wherever
 `org-clock-lock-agenda-log-block' is used -- the lock screen or any
-other org-agenda buffer -- without shadowing TAB elsewhere.")
+other org-agenda buffer -- without shadowing TAB elsewhere.
+Both TAB (C-i, event 9) and [tab] are bound, mirroring
+`org-agenda-mode-map' itself: a GUI frame's physical Tab key can
+generate either event, and a `keymap' text property only matches the
+exact event it defines, so binding just one leaves the other falling
+through to whatever the buffer's local map does with it -- e.g.
+`org-agenda-goto' in a plain org-agenda buffer.")
 
 (define-minor-mode cl::agenda-lock-minor-mode
   "Provide org-clock-lock bindings in the agenda-based lock buffer.
