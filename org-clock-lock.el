@@ -1026,13 +1026,21 @@ Also end current session, unless KEEP-STATE is non-nil."
 ;; `cl::log-entries' is the sole source of truth (the lock buffer is an
 ;; org-agenda buffer, erased and rebuilt on every redo/relock, so nothing can
 ;; live in buffer text between renders).  `cl::log-render' rebuilds the whole
-;; block from it on every call; `cl::log-collapsed-days' says which days to
-;; render without their body lines.  Every rendered line still carries the
-;; `cl::log-line' property so `cl::log-bounds' can find and replace just this
-;; block inside the larger agenda buffer.
+;; block from it on every full agenda (re)build; `cl::log-collapsed-days'
+;; says which days should render collapsed.
+;;
+;; Collapsing/expanding a single day (`cl::log-toggle-day', bound to TAB)
+;; does NOT go through `cl::log-render' again: every day's body lines are
+;; always present in the buffer, and collapsing just marks them invisible
+;; (`cl::log-invis') in place, flipping the ruler's arrow glyph via the
+;; `cl::log-arrow' property.  Nothing is deleted or reinserted, so point
+;; never moves, no matter where in the buffer it was.
 
 (defconst cl::log-title-width 36
   "Display columns reserved for the task title in log lines.")
+
+(defconst cl::log-invis 'org-clock-lock-log-day
+  "Invisibility spec symbol for collapsed log day-blocks.")
 
 (defun cl::log-fmt-day-label (date)
   "Format DATE (YYYY-MM-DD) as e.g. \"Fri 16 May\"."
@@ -1040,13 +1048,24 @@ Also end current session, unless KEEP-STATE is non-nil."
 
 ;;; Line constructors ──────────────────────────────────────────────────────────
 
-(defun cl::log-make-line (line date)
-  "TODO"
+(defun cl::log-make-line (line date &optional body-p)
+  "Attach the shared org-clock-lock log text properties to LINE.
+DATE stamps the `cl::date' property so `cl::log-toggle-day' knows which
+day a line belongs to.  Only the `keymap' property is used (not
+`local-map'): a `keymap' property is consulted ahead of the buffer's
+local map without replacing it, so TAB is bound here without shadowing
+any other binding -- e.g. org-agenda-mode-map's own commands -- while
+point is on a log line.
+BODY-P, when non-nil, also stamps `cl::log-body' with DATE, marking LINE
+as one of that day's body lines (as opposed to its ruler line) so
+`cl::log-toggle-day' can find and hide/show it without touching
+anything else."
   (add-text-properties 0 (length line)
                        (list 'cl::log-line t 'cl::date date
-                             'keymap cl::log-line-map
-                             'local-map cl::log-line-map)
+                             'keymap cl::log-line-map)
                        line)
+  (when body-p
+    (add-text-properties 0 (length line) (list 'cl::log-body date) line))
   line)
 
 (defun cl::log-make-session-line (start end title break-p spent planned cumul date)
@@ -1078,7 +1097,7 @@ DATE is the session date string (YYYY-MM-DD)."
          (annot (when (> cumul spent)
                   (propertize (format "  (%s on task)" (cl::fmt-hh-mm cumul))
                               'face 'shadow))))
-    (cl::log-make-line (concat base (or annot "") "\n") date)))
+    (cl::log-make-line (concat base (or annot "") "\n") date t)))
 
 (defun cl::log-make-gap-line (minutes date)
   "Return a propertized gap indicator line for MINUTES of unaccounted time.
@@ -1089,29 +1108,36 @@ DATE is the date string (YYYY-MM-DD) of the surrounding sessions."
          (right (max 4 (- pad (length label) left)))
          (line  (concat "  " (make-string left ?·)
                         label (make-string right ?·) "\n"))
-         (line (cl::log-make-line line date)))
+         (line (cl::log-make-line line date t)))
     (add-text-properties 0 (length line)
                          (list 'face 'shadow)
                          line)
     line))
 
-(defun cl::log-make-ruler (label spent planned collapsed-p)
+(defun cl::log-make-ruler (label spent planned collapsed-p date)
   "Return a propertized ─── ruler string with LABEL, arrow, and time totals.
 LABEL is the centre text (e.g. \"today\" or a formatted day name).
 SPENT and PLANNED are minute counts rendered as HH:MM in distinct faces.
 COLLAPSED-P controls the ▶/▼ arrow appended to LABEL.
-The returned string carries only face properties — callers add `cl::footer',
-`cl::header', `cl::date', etc. via `add-text-properties'."
-  (let* ((arrow     (if collapsed-p "▶" "▼"))
+DATE stamps the arrow character with a `cl::log-arrow' property so
+`cl::log-toggle-day' can find and swap just that glyph in place.
+The returned string carries only face properties besides that — callers
+add `cl::log-line', `cl::date', etc. via `cl::log-make-line'."
+  (let* ((arrow      (propertize (if collapsed-p "▶" "▼")
+                                 'face 'shadow 'cl::log-arrow date))
          (spent-str  (cl::fmt-hh-mm spent))
          (plan-str   (cl::fmt-hh-mm planned))
-         (core       (format " %s %s  %s spent · %s planned " label arrow spent-str plan-str))
+         (pre        (format " %s " label))
+         (post       (format "  %s spent · %s planned " spent-str plan-str))
+         (core-len   (+ (length pre) 1 (length post)))
          (pad        62)
-         (left       (max 2 (/ (- pad (length core)) 2)))
-         (right      (max 2 (- pad (length core) left))))
+         (left       (max 2 (/ (- pad core-len) 2)))
+         (right      (max 2 (- pad core-len left))))
     (concat
      (propertize (concat "  " (make-string left ?─)) 'face 'shadow)
-     (propertize core                                  'face 'shadow)
+     (propertize pre 'face 'shadow)
+     arrow
+     (propertize post 'face 'shadow)
      (propertize (concat (make-string right ?─) "\n") 'face 'shadow))))
 
 (defun cl::log-make-footer-line (date spent planned &optional collapsed-p)
@@ -1119,7 +1145,7 @@ The returned string carries only face properties — callers add `cl::footer',
 DATE is the date string (YYYY-MM-DD) stored as a text property.
 SPENT and PLANNED are minute counts for the day so far.
 COLLAPSED-P controls the ▶/▼ arrow shown next to \"today\"."
-  (let ((line (cl::log-make-ruler "today" spent planned collapsed-p)))
+  (let ((line (cl::log-make-ruler "today" spent planned collapsed-p date)))
     (cl::log-make-line line date)))
 
 (defun cl::log-make-header-line (date spent planned collapsed-p)
@@ -1128,7 +1154,7 @@ DATE is the date string (YYYY-MM-DD), formatted as e.g. \"Fri 16 May\" in the la
 SPENT and PLANNED are minute totals for that day.
 COLLAPSED-P controls the ▶/▼ arrow shown next to the day label."
   (let ((line (cl::log-make-ruler (cl::log-fmt-day-label date)
-                                  spent planned collapsed-p)))
+                                  spent planned collapsed-p date)))
     (cl::log-make-line line date)))
 
 ;;; Log operations ─────────────────────────────────────────────────────────────
@@ -1164,7 +1190,11 @@ start and the next (older) entry's end."
 
 (defun cl::log-render ()
   "Return the full rendered log section, most recent day first.
-Always includes today, even with no sessions logged yet."
+Always includes today, even with no sessions logged yet.  Every day's
+body lines are always included, even when the day is in
+`cl::log-collapsed-days': they're marked invisible (`cl::log-invis')
+rather than omitted, so `cl::log-toggle-day' can show/hide a day in
+place afterwards without ever needing to rebuild this block."
   (let* ((today   (format-time-string "%Y-%m-%d"))
          (by-date (seq-group-by (lambda (e) (plist-get e :date)) cl::log-entries))
          (dates   (sort (cl-adjoin today (mapcar #'car by-date) :test #'equal)
@@ -1178,36 +1208,44 @@ Always includes today, even with no sessions logged yet."
                                    :key (lambda (e) (plist-get e :spent))))
               (planned (cl-reduce #'+ entries :initial-value 0
                                    :key (lambda (e) (plist-get e :planned))))
-              (collapsed-p (and (member date cl::log-collapsed-days) t)))
+              (collapsed-p (and (member date cl::log-collapsed-days) t))
+              (body    (cl::log-render-day entries date)))
+         (when (and collapsed-p (> (length body) 0))
+           (add-text-properties 0 (length body) (list 'invisible cl::log-invis) body))
          (concat (if (equal date today)
                      (cl::log-make-footer-line date spent planned collapsed-p)
                    (cl::log-make-header-line date spent planned collapsed-p))
-                 (unless collapsed-p (cl::log-render-day entries date)))))
+                 body)))
      dates "")))
 
-(defun cl::log-bounds ()
-  "Return (START . END) of the rendered log block, or nil if absent."
-  (when-let* ((start (text-property-any (point-min) (point-max) 'cl::log-line t)))
-    (cons start (or (text-property-not-all start (point-max) 'cl::log-line t)
-                    (point-max)))))
-
-(defun cl::redraw-log ()
-  "Regenerate the log block from `cl::log-entries' in place."
-  (when-let* ((bounds (cl::log-bounds)))
-    (let ((inhibit-read-only t))
-      (save-excursion
-        (delete-region (car bounds) (cdr bounds))
-        (goto-char (car bounds))
-        (insert (cl::log-render))))))
-
 (defun cl::log-toggle-day ()
-  "Toggle collapse/expand of the log day-block at point."
+  "Toggle collapse/expand of the log day-block at point, in place.
+Unlike rebuilding via `cl::log-render', this only flips the `invisible'
+property on the day's body lines and swaps the ruler's arrow glyph --
+no text anywhere in the buffer is deleted or reinserted, so point
+never moves, regardless of where it was when TAB was pressed."
   (interactive)
   (when-let* ((date (get-text-property (point) 'cl::date)))
-    (if (member date cl::log-collapsed-days)
-        (setq cl::log-collapsed-days (delete date cl::log-collapsed-days))
-      (push date cl::log-collapsed-days))
-    (cl::redraw-log)))
+    (let ((collapsing (not (member date cl::log-collapsed-days))))
+      (if collapsing
+          (push date cl::log-collapsed-days)
+        (setq cl::log-collapsed-days (delete date cl::log-collapsed-days)))
+      (let ((inhibit-read-only t))
+        (save-excursion
+          (when-let* ((arrow-pos (text-property-any (point-min) (point-max)
+                                                     'cl::log-arrow date)))
+            (goto-char arrow-pos)
+            (delete-char 1)
+            (insert (propertize (if collapsing "▶" "▼")
+                                'face 'shadow 'cl::log-arrow date)))
+          (when-let* ((start (text-property-any (point-min) (point-max)
+                                                 'cl::log-body date))
+                      (end   (or (text-property-not-all start (point-max)
+                                                         'cl::log-body date)
+                                (point-max))))
+            (if collapsing
+                (put-text-property start end 'invisible cl::log-invis)
+              (remove-text-properties start end '(invisible nil)))))))))
 
 (defun cl:agenda-log-block (&optional _match)
   "Org-agenda block showing org-clock-lock's day log of clocked sessions.
@@ -1219,8 +1257,11 @@ e.g.
 
 or call it directly as its own agenda command.  TAB on any log line
 toggles that day's block; the binding is a `keymap' text property
-local to the log's lines, so it does not shadow TAB anywhere else in
-whatever agenda buffer this is embedded in.
+local to the log's lines, so it neither shadows TAB anywhere else in
+whatever agenda buffer this is embedded in, nor any other binding
+\(e.g. org-agenda-mode-map's own commands\) while point is on a log
+line -- a `keymap' property is consulted ahead of, not instead of, the
+buffer's local map.
 
 The block's header respects `org-agenda-overriding-header' like any
 other block, so a series entry can override it via its own settings,
@@ -1230,6 +1271,7 @@ e.g.
    \"\" ((org-agenda-overriding-header \"Sessions\")))"
   (interactive)
   (org-agenda-prepare "Clock log")
+  (add-to-invisibility-spec cl::log-invis)
   (let ((inhibit-read-only t))
     (goto-char (point-max))
     (let ((s (point)))
@@ -1245,7 +1287,12 @@ e.g.
    (list 'org-agenda-type 'org-clock-lock-log
          'org-redo-cmd '(org-clock-lock-agenda-log-block)))
   (org-agenda-finalize)
-  (unless org-agenda-multi (setq buffer-read-only t)))
+  ;; Unconditional, matching every built-in single-command entry point
+  ;; (`org-agenda-list', `org-todo-list', ...): each block in a series
+  ;; calls `org-agenda-prepare' itself, which clears `buffer-read-only'
+  ;; whenever `org-agenda-multi' is set, so whichever block runs last
+  ;; must always restore it or the whole buffer is left editable.
+  (setq buffer-read-only t))
 
 (defun cl:ui--log-session-entry ()
   "Record the just-completed session in `cl::log-entries'.
