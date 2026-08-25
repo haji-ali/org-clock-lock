@@ -635,17 +635,24 @@ C-g at any prompt leaves the current clock running."
 
 (defun cl::agenda-new-session ()
   "Start a session, defaulting to the task at point in the lock screen.
-On an agenda line for a task (an `org-marker' or `org-hd-marker' text
+On an agenda line for a task (an `org-hd-marker' or `org-marker' text
 property present at point) \"t\" is taken to mean \"clock into this
 task\": skip the picker and go straight to the duration prompt for it.
+Prefers `org-hd-marker' -- the heading's own position -- over
+`org-marker', which for e.g. a scheduled entry points at the timestamp
+instead; `cl::heading-at' and friends need point on the heading line.
+A clock already running for that SAME task is left alone (just a
+message, no re-prompt); a clock running for a DIFFERENT task is ended
+first, same as `org-clock-lock-switch-task'.  Same comparison
+`org-agenda-mark-clocking-task' itself uses: `org-hd-marker' against
+`org-clock-hd-marker', not the entry/CLOCK-line markers.
 Falls back to the full task picker (`org-clock-lock-new-session') when
 point isn't on a task line."
   (interactive)
-  (if-let* ((marker (or (org-get-at-bol 'org-marker)
-                        (org-get-at-bol 'org-hd-marker))))
-      (if (org-clocking-p)
-          (unless (cl::adopt-running-clock)
-            (user-error "Can't clock another"))
+  (if-let* ((marker (or (org-get-at-bol 'org-hd-marker)
+                        (org-get-at-bol 'org-marker))))
+      (if (and (org-clocking-p) (cl::markers-equal-p marker org-clock-hd-marker))
+          (message "Already clocked into \"%s\"" (cl::heading-at marker))
         (let* ((title        (cl::heading-at marker))
                (break-p      (cl::marker-is-break-p marker))
                (default-mins (or (cl::effort-minutes marker)
@@ -655,6 +662,8 @@ point isn't on a task line."
                                 (format "Work on \"%s\" for" title)
                                 default-mins))))
           (when mins
+            (when (org-clocking-p)
+              (cl::org-clock-out nil t))
             (cl::begin-session title (copy-marker marker) mins))))
     (cl:new-session)))
 
