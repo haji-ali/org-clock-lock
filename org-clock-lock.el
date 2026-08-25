@@ -118,7 +118,7 @@ same retroactive clock-out options as for keyboard idle."
 (defvar cl::agenda-map
   (let ((m (make-sparse-keymap)))
     (define-key m [remap save-buffer] #'ignore)
-    (define-key m (kbd "t") #'cl:new-session)
+    (define-key m (kbd "t") #'cl::agenda-new-session)
     (define-key m (kbd "g") #'cl::agenda-redo)
     (define-key m (kbd "r") #'cl::agenda-redo)
     m)
@@ -633,6 +633,31 @@ C-g at any prompt leaves the current clock running."
   (interactive)
   (cl:new-session nil t))
 
+(defun cl::agenda-new-session ()
+  "Start a session, defaulting to the task at point in the lock screen.
+On an agenda line for a task (an `org-marker' or `org-hd-marker' text
+property present at point) \"t\" is taken to mean \"clock into this
+task\": skip the picker and go straight to the duration prompt for it.
+Falls back to the full task picker (`org-clock-lock-new-session') when
+point isn't on a task line."
+  (interactive)
+  (if-let* ((marker (or (org-get-at-bol 'org-marker)
+                        (org-get-at-bol 'org-hd-marker))))
+      (if (org-clocking-p)
+          (unless (cl::adopt-running-clock)
+            (user-error "Can't clock another"))
+        (let* ((title        (cl::heading-at marker))
+               (break-p      (cl::marker-is-break-p marker))
+               (default-mins (or (cl::effort-minutes marker)
+                                 (if break-p cl:default-break cl:default-duration)))
+               (mins         (ignore-error quit
+                               (cl::read-minutes
+                                (format "Work on \"%s\" for" title)
+                                default-mins))))
+          (when mins
+            (cl::begin-session title (copy-marker marker) mins))))
+    (cl:new-session)))
+
 ;;; Timers
 (defun cl::tick ()
   "1-second heartbeat: refresh the header and detect sleep/wake cycles.
@@ -775,7 +800,8 @@ The function loops until the user commits a fully resolved choice."
                            (max 0 (min max-mins
                                        (string-to-number
                                         (read-string
-                                         (format "Minutes to keep (0–%d) [0]: " max-mins)
+                                         (format "Minutes of \"%s\" to keep (0–%d) [0]: "
+                                                 prev-title max-mins)
                                          nil nil "0"))))))))
             ;; nil keep = C-g at sub-prompt → loop back to task picker
             (when keep
