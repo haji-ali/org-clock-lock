@@ -1204,31 +1204,39 @@ COLLAPSED-P controls the ▶/▼ arrow shown next to the day label."
 (defun cl::log-render-day (entries date)
   "Render one day's session/gap lines, newest first.
 ENTRIES are that DATE's plists from `cl::log-entries', newest first.
-The cumulative-on-task annotation for each line sums that entry and every
-older same-marker entry in ENTRIES; gaps are the time between one entry's
-start and the next (older) entry's end."
-  (apply #'concat
-         (cl-loop for (e . older) on entries
-                  for cumul = (cl-reduce
-                               #'+ (cons e older) :initial-value 0
-                               :key (lambda (x)
-                                      (if (cl::markers-equal-p
-                                           (plist-get x :marker) (plist-get e :marker))
-                                          (plist-get x :spent) 0)))
-                  collect (cl::log-make-session-line
-                           (plist-get e :start) (plist-get e :end)
-                           (plist-get e :title) (plist-get e :break-p)
-                           (plist-get e :spent) (plist-get e :planned)
-                           cumul date)
-                  when older
-                  collect (let ((gap (max 0 (round
-                                              (/ (float-time
-                                                  (time-subtract (plist-get e :start)
-                                                                 (plist-get (car older) :end)))
-                                                 60)))))
-                            (if (>= gap cl:log-min-gap-minutes)
-                                (cl::log-make-gap-line gap date)
-                              "")))))
+The cumulative-on-task annotation is shown once per task, on its most
+recent entry, and sums every same-marker entry in ENTRIES; older entries
+of the same task carry no annotation.  Gaps are the time between one
+entry's start and the next (older) entry's end."
+  (let (seen)
+    (apply #'concat
+           (cl-loop for (e . older) on entries
+                    for marker = (plist-get e :marker)
+                    for newest-p = (not (cl-find marker seen
+                                                 :test #'cl::markers-equal-p))
+                    for cumul = (if newest-p
+                                    (cl-reduce
+                                     #'+ (cons e older) :initial-value 0
+                                     :key (lambda (x)
+                                            (if (cl::markers-equal-p
+                                                 (plist-get x :marker) marker)
+                                                (plist-get x :spent) 0)))
+                                  (plist-get e :spent))
+                    do (when newest-p (push marker seen))
+                    collect (cl::log-make-session-line
+                             (plist-get e :start) (plist-get e :end)
+                             (plist-get e :title) (plist-get e :break-p)
+                             (plist-get e :spent) (plist-get e :planned)
+                             cumul date)
+                    when older
+                    collect (let ((gap (max 0 (round
+                                               (/ (float-time
+                                                   (time-subtract (plist-get e :start)
+                                                                  (plist-get (car older) :end)))
+                                                  60)))))
+                              (if (>= gap cl:log-min-gap-minutes)
+                                  (cl::log-make-gap-line gap date)
+                                ""))))))
 
 (defun cl::log-render ()
   "Return the full rendered log section, most recent day first.
