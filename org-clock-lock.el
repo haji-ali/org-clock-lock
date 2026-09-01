@@ -747,17 +747,24 @@ PROTECT-SECONDS is the keystroke suppression window (seconds) for the
 very first call to the task picker; nil or zero disables it.
 
 Returns a plist (:marker M :keep K :duration D :break-p B) where:
-  :marker   — task to clock into (a marker), or nil (stay locked, no new session)
-  :keep     — minutes of the old session to retain, or \\='all (keep everything)
-  :duration — minutes for the new session, or nil (no new session, stay locked)
-  :break-p  — break-filter state in effect when :marker was committed; used
-              to tag a freshly typed title (a new task) with a BREAK property
+  :marker       — task to clock into (a marker), or nil (stay locked, no new session)
+  :keep         — minutes of the old session to retain, or \\='all (keep everything)
+  :duration     — minutes for the new session, or nil (no new session, stay locked)
+  :break-p      — break-filter state in effect when :marker was committed; used
+                  to tag a freshly typed title (a new task) with a BREAK property
+  :new-position — minutes past BOUNDARY at which the new session actually
+                  started, when :marker differs from PREV-MARKER (nil
+                  otherwise); the gap between :keep and :new-position is
+                  unaccounted dead time, credited to neither task
+  :pre-elapsed  — minutes of the new session already elapsed before the
+                  duration prompt, i.e. how far :new-position is behind now
 
 Special case: when :marker equals PREV-MARKER and :keep is \\='all, the old
 session is resumed for :duration minutes without clocking out.
 
-C-g at any sub-prompt (keep-minutes, duration) returns to the task picker.
-The function loops until the user commits a fully resolved choice."
+C-g at any sub-prompt (keep-minutes, started-ago, duration) returns to the
+task picker. The function loops until the user commits a fully resolved
+choice."
   (let (result (break-state (list break-p)))
     (while (null result)
       (let* ((keep-all nil)
@@ -838,25 +845,62 @@ The function loops until the user commits a fully resolved choice."
                 (setq result (list :marker marker :keep 'all
                                    :duration (round (/ remaining 60))
                                    :break-p (car break-state)))
-              (let* ((base (max 0 (round
-                                   (/ (float-time
-                                       (time-subtract (current-time) boundary))
-                                      60))))
-                     (mins (ignore-error quit
-                             (cl::read-minutes
-                              (format (if same-p "Continue \"%s\" for" "Work on \"%s\" for")
-                                      title)
-                              default-mins
-                              (and same-p base)))))
-                ;; nil mins = C-g at duration prompt → loop back to task picker
-                (when mins
-                  (setq result
-                        (if (and same-p (<= mins base))
-                            ;; Clock-out
-                            (list :marker nil :keep mins :duration nil)
-                          (list :marker marker :keep base
-                                :duration (if same-p (- mins base) mins)
-                                :break-p (car break-state))))))))))))
+              (let ((base (max 0 (round
+                                  (/ (float-time
+                                      (time-subtract (current-time) boundary))
+                                     60)))))
+                (if same-p
+                    (let ((mins (ignore-error quit
+                                  (cl::read-minutes
+                                   (format "Continue \"%s\" for" title)
+                                   default-mins base))))
+                      ;; nil mins = C-g at duration prompt → loop back to task picker
+                      (when mins
+                        (setq result
+                              (if (<= mins base)
+                                  ;; Clock-out
+                                  (list :marker nil :keep mins :duration nil)
+                                (list :marker marker :keep base
+                                      :duration (- mins base)
+                                      :break-p (car break-state))))))
+                  ;; ── Different task: ask when each side actually happened ──
+                  (let* ((old-stopped-ago
+                          (if (= base 0) 0
+                            (ignore-error quit
+                              (max 0 (min base
+                                          (string-to-number
+                                           (read-string
+                                            (format "Minutes ago \"%s\" stopped (0–%d) [0]: "
+                                                    prev-title base)
+                                            nil nil "0")))))))
+                         (new-started-ago
+                          (and old-stopped-ago
+                               (if (= old-stopped-ago 0) 0
+                                 (ignore-error quit
+                                   (max 0 (min old-stopped-ago
+                                               (string-to-number
+                                                (read-string
+                                                 (format "Minutes ago \"%s\" started (0–%d) [0]: "
+                                                         title old-stopped-ago)
+                                                 nil nil "0")))))))))
+                    ;; nil new-started-ago = C-g at either sub-prompt → loop back to task picker
+                    (when new-started-ago
+                      (let ((mins (ignore-error quit
+                                    (cl::read-minutes
+                                     (format "Work on \"%s\" for" title)
+                                     default-mins
+                                     (and (> new-started-ago 0) new-started-ago)))))
+                        ;; nil mins = C-g at duration prompt → loop back to task picker
+                        (when mins
+                          (setq result
+                                (list :marker marker
+                                      :keep (- base old-stopped-ago)
+                                      :new-position (- base new-started-ago)
+                                      :duration (if (> new-started-ago 0)
+                                                    (- mins new-started-ago)
+                                                  mins)
+                                      :pre-elapsed new-started-ago
+                                      :break-p (car break-state)))))))))))))))
     result))
 
 (defun cl::interrupt-prompt ()
@@ -871,7 +915,9 @@ user's fully committed choice.  Dispatches the result:
   Same marker, :keep \\='all  — resume: re-arm the session for :duration minutes
                                without clocking out.
   Otherwise               — clock out at boundary+K (or now), clock into
-                             :marker for :duration minutes."
+                             :marker at boundary+:new-position (or now, if
+                             :new-position is nil) for :duration minutes.
+                             Any gap between the two is unaccounted dead time."
   (when (and cl::session (not cl::locked-p))
     (minibuf-ext-when-inactive
      (when (and cl::session (not cl::locked-p))
@@ -922,8 +968,14 @@ user's fully committed choice.  Dispatches the result:
                                       (copy-marker marker)
                                     (cl::capture-org-task
                                      title (and (plist-get choice :break-p)
-                                                '(("BREAK" . "t")))))))
-                 (cl::begin-session title new-marker duration))))))))))
+                                                '(("BREAK" . "t"))))))
+                      (new-position (plist-get choice :new-position))
+                      (start-time (and new-position
+                                       (time-add boundary
+                                                 (seconds-to-time (* new-position 60))))))
+                 (cl::begin-session title new-marker duration
+                                    (plist-get choice :pre-elapsed)
+                                    start-time))))))))))
 
 ;;; Org-clock integration
 
@@ -966,11 +1018,15 @@ If still clocked in (task switched), adopt the new clock immediately."
 
 ;;; State transitions
 
-(defun cl::begin-session (title marker minutes &optional continue)
+(defun cl::begin-session (title marker minutes &optional continue start-time)
   "Transition to unlocked state for TITLE (at MARKER) for MINUTES.
 With CONTINUE non-nil, this is a continuation of the previous session:
 :planned-minutes accumulates the additional minutes on top of the
-previous planned total."
+previous planned total.  When CONTINUE is a number it is also added,
+representing extra already-elapsed minutes not otherwise reflected in
+MINUTES (see the backdated-switch path in `cl::interrupt-prompt').
+START-TIME, when non-nil, backdates the clock-in to that time instead
+of clocking in now; passed straight through to `org-clock-in'."
   (cl-block nil
     (setq cl::locked-p nil)
     (let* ((prev-planned (and continue cl::session
@@ -987,7 +1043,7 @@ previous planned total."
       ;; session which calls cl::end-session, which then resets cl::session
       (unless (org-clocking-p)
         (condition-case err
-            (org-with-point-at marker (org-clock-in))
+            (org-with-point-at marker (org-clock-in nil start-time))
           (error
            (message "org-clock-lock: failed to clock in to \"%s\": %s"
                     title (error-message-string err))
