@@ -130,6 +130,22 @@ emacsclient --eval "(org-clock-lock-on-sleep (current-time))"
 Set `org-clock-lock-clock-out-on-sleep` to `t` to skip the prompt entirely
 and clock out automatically at the sleep boundary.
 
+### Deferring the prompt
+
+Set `org-clock-lock-defer-interrupt-prompt` to `t` to skip straight to the
+plain lock screen on interrupt, without opening the prompt. The old clock
+keeps running, frozen at the interrupt boundary, until you press `t` (or
+otherwise start a new session) — at that point the same prompt appears,
+covering both what to do with the interrupted task and which task to start
+next, exactly as if the interrupt had just happened.
+
+In this mode, `C-g` at the task picker doesn't force a decision — it's a
+clean no-op back to the plain lock screen, nothing clocked out, so you can
+leave the interrupt unresolved and come back to it later. (This differs
+from the immediate-prompt case above, where `C-g` opens the "minutes to
+keep" sub-prompt instead, since a live interrupt has already happened and
+needs a resolution.)
+
 ## Customisation
 
 | Variable | Default | Description |
@@ -141,6 +157,7 @@ and clock out automatically at the sleep boundary.
 | `org-clock-lock-idle-warn-seconds` | 300 | Idle detection threshold (`nil` to disable) |
 | `org-clock-lock-sleep-detect-seconds` | 10 | Tick gap that signals sleep |
 | `org-clock-lock-clock-out-on-sleep` | `nil` | Auto clock-out on sleep without prompting |
+| `org-clock-lock-defer-interrupt-prompt` | `nil` | Lock without prompting on interrupt; resolve later via `t` |
 | `org-clock-lock-show-header` | `t` | Show header-line countdown |
 | `org-clock-lock-log-progress` | `nil` | Append a LOGBOOK note after each session |
 | `org-clock-lock-log-min-gap-minutes` | 10 | Minimum gap shown in the session log |

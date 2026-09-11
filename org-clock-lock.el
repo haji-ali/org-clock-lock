@@ -100,6 +100,28 @@ When nil (default) the interrupt prompt is shown instead, giving the
 same retroactive clock-out options as for keyboard idle."
   :type 'boolean)
 
+(defcustom cl:defer-interrupt-prompt nil
+  "Non-nil to defer the interrupt prompt until a new task is picked.
+When nil (default), an interrupt (idle, sleep, or session expiry) locks
+the screen and immediately opens the interactive prompt asking what to
+do with the just-interrupted task.
+
+When non-nil, the interrupt only locks the screen; the prompt is not
+shown.  The old clock keeps running (frozen at the interrupt boundary,
+same as always) until you press \"t\" on the lock screen or invoke
+`org-clock-lock-new-session' -- at that point the same prompt appears,
+covering both what to do with the old task (resume, backdate, credit
+time back to it, cancel it) and which new task to start, exactly as if
+the interrupt had just happened.
+
+In this mode, C-g at the top-level task picker does not force a
+decision: it silently cancels back to the plain lock screen, leaving
+the old task's fate undecided and nothing clocked out, so you can defer
+again and revisit later.  This differs from the immediate-prompt case,
+where C-g instead opens a \"minutes to keep\" sub-prompt, since an
+already-fired live interrupt requires a resolution."
+  :type 'boolean)
+
 
 ;;; Faces
 
@@ -205,6 +227,16 @@ Activation variable for `emulation-mode-map-alists'.")
   "Float-time of the most recent `cl::tick' call, or nil before the first tick.
 Nil is reset by `cl::cancel-timers' so the first tick of a new session
 does not false-positive against a stale pre-sleep timestamp.")
+
+(defvar cl::pending-interrupt nil
+  "Cons (KIND-LABEL . BOUNDARY) for a not-yet-resolved deferred interrupt.
+Set by `cl::interrupt-prompt' when `cl:defer-interrupt-prompt' is
+non-nil, instead of resolving the interrupt immediately.  Nil when there
+is nothing pending.  The interrupted task's marker/title/break-p are not
+duplicated here -- they are still sitting in `cl::session', which
+`cl::end-session' left intact (keep-state t) precisely for this purpose.
+Cleared by `cl::interrupt-dispatch' once the user commits a resolution,
+and on `org-clock-lock-mode' disable.")
 
 
 (defvar cl:session-start-hook nil
@@ -604,42 +636,54 @@ Suffix shows category, today's clocked time (HH:MM), and effort."
 PROMPT is an optional string used as the task picker prompt prefix.
 SWITCH, when non-nil, clocks out of the current task only after a
 successful selection; C-g leaves the current clock running.
-C-g at the duration prompt returns to the task picker."
+C-g at the duration prompt returns to the task picker.
+
+When `org-clock-lock--pending-interrupt' is set -- a deferred interrupt
+awaiting resolution, see `org-clock-lock-defer-interrupt-prompt' -- PROMPT
+and SWITCH are ignored and this instead resolves that interrupt via
+`org-clock-lock--interrupt-resolve': its picker covers both what to do
+with the interrupted task and which task to start next, exactly as if
+the interrupt had just happened.  A bare C-g at that picker is a clean
+no-op -- nothing clocked out, the interrupt still pending."
   (interactive)
-  (if (and (not switch) (org-clocking-p))
-      (unless (cl::adopt-running-clock)
-        (user-error "Can't clock another"))
-    (let (done)
-      (while (not done)
-        (let ((break-state (list nil)))
-          (when-let*
-              ((marker (cl:read-task prompt nil nil break-state))
-               (confirmed (or (markerp marker)
-                              (ignore-error quit
-                                (y-or-n-p "Create new task?")))))
-            (let* ((title        (if (markerp marker)
-                                     (cl::heading-at marker)
-                                   marker))
-                   (break-p      (if (markerp marker)
-                                     (cl::marker-is-break-p marker)
-                                   (car break-state)))
-                   (default-mins (or (and (markerp marker)
-                                          (cl::effort-minutes marker))
-                                     (if break-p cl:default-break
-                                       cl:default-duration)))
-                   (mins         (ignore-error quit
-                                   (cl::read-minutes
-                                    (format "Work on \"%s\" for" title)
-                                    default-mins))))
-              (when mins
-                (setq marker (if (markerp marker)
-                                 (copy-marker marker)
-                               (cl::capture-org-task
-                                title (and break-p '(("BREAK" . "t"))))))
-                (when switch
-                  (cl::org-clock-out nil t))
-                (cl::begin-session title (copy-marker marker) mins)
-                (setq done t)))))))))
+  (if cl::pending-interrupt
+      (cl::interrupt-resolve (car cl::pending-interrupt)
+                             (cdr cl::pending-interrupt)
+                             t)
+    (if (and (not switch) (org-clocking-p))
+        (unless (cl::adopt-running-clock)
+          (user-error "Can't clock another"))
+      (let (done)
+        (while (not done)
+          (let ((break-state (list nil)))
+            (when-let*
+                ((marker (cl:read-task prompt nil nil break-state))
+                 (confirmed (or (markerp marker)
+                                (ignore-error quit
+                                  (y-or-n-p "Create new task?")))))
+              (let* ((title        (if (markerp marker)
+                                       (cl::heading-at marker)
+                                     marker))
+                     (break-p      (if (markerp marker)
+                                       (cl::marker-is-break-p marker)
+                                     (car break-state)))
+                     (default-mins (or (and (markerp marker)
+                                            (cl::effort-minutes marker))
+                                       (if break-p cl:default-break
+                                         cl:default-duration)))
+                     (mins         (ignore-error quit
+                                     (cl::read-minutes
+                                      (format "Work on \"%s\" for" title)
+                                      default-mins))))
+                (when mins
+                  (setq marker (if (markerp marker)
+                                   (copy-marker marker)
+                                 (cl::capture-org-task
+                                  title (and break-p '(("BREAK" . "t"))))))
+                  (when switch
+                    (cl::org-clock-out nil t))
+                  (cl::begin-session title (copy-marker marker) mins)
+                  (setq done t))))))))))
 
 (defun cl:switch-task ()
   "Select a new task then clock out of current and clock in.
@@ -661,10 +705,17 @@ first, same as `org-clock-lock-switch-task'.  Same comparison
 `org-agenda-mark-clocking-task' itself uses: `org-hd-marker' against
 `org-clock-hd-marker', not the entry/CLOCK-line markers.
 Falls back to the full task picker (`org-clock-lock-new-session') when
-point isn't on a task line."
+point isn't on a task line.
+
+When `org-clock-lock--pending-interrupt' is set, the marker-at-point fast
+path is skipped entirely -- deferred interrupts always go through the
+full picker (via `org-clock-lock-new-session'), which is what asks what
+to do with the interrupted task alongside picking the next one."
   (interactive)
-  (if-let* ((marker (or (org-get-at-bol 'org-hd-marker)
-                        (org-get-at-bol 'org-marker))))
+  (if cl::pending-interrupt
+      (cl:new-session)
+    (if-let* ((marker (or (org-get-at-bol 'org-hd-marker)
+                          (org-get-at-bol 'org-marker))))
       (if (and (org-clocking-p) (cl::markers-equal-p marker org-clock-hd-marker))
           (message "Already clocked into \"%s\"" (cl::heading-at marker))
         (let* ((title        (cl::heading-at marker))
@@ -679,7 +730,7 @@ point isn't on a task line."
             (when (org-clocking-p)
               (cl::org-clock-out nil t))
             (cl::begin-session title (copy-marker marker) mins))))
-    (cl:new-session)))
+      (cl:new-session))))
 
 ;;; Timers
 (defun cl::tick ()
@@ -831,7 +882,8 @@ there is no \"clock out\" fallback once a new task has been picked."
     (unless (eq result :quit) result)))
 
 (defun cl::interrupt-pick (kind-label break-p boundary prev-marker prev-title
-                                      expand-state protect-seconds)
+                                      expand-state protect-seconds
+                                      &optional abort-on-quit)
   "Interactively collect the user's full interrupt response.
 
 KIND-LABEL is the display string for what triggered the interrupt
@@ -845,8 +897,17 @@ EXPAND-STATE is a one-element list whose car reflects whether the full
 candidate list is currently shown; updated in place for the live prompt.
 PROTECT-SECONDS is the keystroke suppression window (seconds) for the
 very first call to the task picker; nil or zero disables it.
+ABORT-ON-QUIT, when non-nil, makes a bare C-g at the top-level task
+picker abort the whole pick and return nil, instead of opening the
+\"minutes to keep\" sub-prompt.  Used when the interrupt is being
+resolved on the user's own initiative (`cl:defer-interrupt-prompt') so
+backing out costs nothing -- no decision is forced, nothing is clocked
+out.  C-g at a duration sub-prompt still just loops back to the task
+picker either way (see below), so this only changes what a *second*,
+top-level C-g does.
 
-Returns a plist (:marker M :keep K :duration D :break-p B) where:
+Returns a plist (:marker M :keep K :duration D :break-p B), or nil if
+ABORT-ON-QUIT fired, where:
   :marker       — task to clock into (a marker), or nil (stay locked, no new session)
   :keep         — minutes of the old session to retain, or \\='all (keep everything)
   :duration     — minutes for the new session, or nil (no new session, stay locked)
@@ -923,6 +984,10 @@ The function loops until the user commits a fully resolved choice."
          (cancel-p
           (setq result (list :marker nil :keep 0 :duration nil :cancel t)))
 
+         ;; ── C-g at picker, ABORT-ON-QUIT: bail out, nothing decided ─────
+         ((and (null marker) abort-on-quit)
+          (setq result :abort))
+
          ;; ── C-g at picker: open keep-minutes prompt recursively ─────────
          ((null marker)
           (let* ((max-mins (max 0 (round (/ (float-time
@@ -993,14 +1058,14 @@ The function loops until the user commits a fully resolved choice."
                                     :duration (- mins n)
                                     :pre-elapsed n
                                     :break-p (car break-state))))))))))))))
-    result))
+    (unless (eq result :abort) result)))
 
-(defun cl::interrupt-prompt ()
-  "Unified session interrupt handler for idle/sleep/expiry.
-
-Defers until no minibuffer is active.  Determines the earliest boundary,
-cancels timers, locks, then calls `cl::interrupt-pick' once to collect the
-user's fully committed choice.  Dispatches the result:
+(defun cl::interrupt-dispatch (choice prev-marker prev-title boundary)
+  "Apply CHOICE, a plist as returned by `cl::interrupt-pick', and clean up.
+PREV-MARKER/PREV-TITLE are the interrupted task; BOUNDARY is the
+interrupt boundary time value CHOICE's :keep/:new-position are relative
+to.  Clears `cl::pending-interrupt' first, since committing any CHOICE
+resolves it.  Dispatches:
 
   Same marker, :keep \\='all — resume: re-arm the session for :duration
                               minutes without clocking out.
@@ -1014,6 +1079,105 @@ user's fully committed choice.  Dispatches the result:
                               Any gap between the two is unaccounted dead time.
 
 In every case, one final `message' summarizes what happened."
+  (setq cl::pending-interrupt nil)
+  (let* ((marker   (plist-get choice :marker))
+         (keep     (plist-get choice :keep))
+         (duration (plist-get choice :duration))
+         (cancel-p (plist-get choice :cancel))
+         (resume-p (and marker
+                        (cl::markers-equal-p marker prev-marker)
+                        duration)))
+    (cond
+     (resume-p
+      ;; Resume: same task, no absent time discarded — continue=t
+      ;; so planned minutes accumulate correctly.
+      (cl::begin-session prev-title
+                         (copy-marker prev-marker)
+                         duration
+                         (or keep 0))
+      (message "Resumed \"%s\", +%d min — running until %s"
+               prev-title duration
+               (format-time-string
+                "%H:%M" (time-add (current-time) (seconds-to-time (* duration 60))))))
+
+     (cancel-p
+      (cl::org-clock-cancel)
+      (message "Canceled \"%s\" — nothing logged" prev-title))
+
+     (t
+      ;; Clock out the previous task at the appropriate time.
+      (if (eq keep 'all)
+          (cl::org-clock-out nil t)
+        (cl::org-clock-out nil t
+                           (time-add boundary
+                                     (seconds-to-time (* keep 60)))))
+      (if (and marker duration)
+          (let* ((title (if (markerp marker) (cl::heading-at marker) marker))
+                 (new-marker (if (markerp marker)
+                                 (copy-marker marker)
+                               (cl::capture-org-task
+                                title (and (plist-get choice :break-p)
+                                           '(("BREAK" . "t"))))))
+                 (new-position (plist-get choice :new-position))
+                 (pre-elapsed  (plist-get choice :pre-elapsed))
+                 (start-time (and new-position
+                                  (time-add boundary
+                                            (seconds-to-time (* new-position 60))))))
+            (cl::begin-session title new-marker duration pre-elapsed start-time)
+            (message "Clocked out \"%s\" (%s); clocked into \"%s\"%s, %d min — until %s"
+                     prev-title
+                     (if (eq keep 'all) "kept all" (format "kept %d min" (or keep 0)))
+                     title
+                     (if (and pre-elapsed (> pre-elapsed 0))
+                         (format " (started %d min ago)" pre-elapsed)
+                       "")
+                     duration
+                     (format-time-string
+                      "%H:%M"
+                      (time-add (or start-time (current-time))
+                                (seconds-to-time (* duration 60))))))
+        (message "Clocked out \"%s\" (%s); staying locked"
+                 prev-title
+                 (if (eq keep 'all) "kept all" (format "kept %d min" (or keep 0)))))))))
+
+(defun cl::interrupt-resolve (kind-label boundary &optional abort-on-quit)
+  "Run the interrupt picker against the still-locked `cl::session' and dispatch.
+KIND-LABEL and BOUNDARY describe the interrupt (see `cl::interrupt-pick').
+ABORT-ON-QUIT is passed through to `cl::interrupt-pick': non-nil makes a
+bare C-g at the top-level task picker a clean no-op instead of forcing a
+keep-minutes decision.  Does nothing (stays locked, `cl::pending-interrupt'
+untouched) when the picker is aborted.
+Assumes `cl::session' still holds the interrupted task's marker/title/
+break-p, i.e. `cl::end-session' was called with KEEP-STATE t and no
+session has begun since."
+  (let* ((prev-marker  (cl::session-marker  cl::session))
+         (prev-title   (cl::session-title   cl::session))
+         (break-p      (cl::session-break-p cl::session))
+         (expand-state (list nil))
+         (choice       (cl::interrupt-pick
+                        kind-label break-p boundary
+                        prev-marker prev-title
+                        expand-state cl:prompt-protect-seconds
+                        abort-on-quit)))
+    (when choice
+      (cl::interrupt-dispatch choice prev-marker prev-title boundary))))
+
+(defun cl::interrupt-prompt ()
+  "Unified session interrupt handler for idle/sleep/expiry.
+
+Defers until no minibuffer is active.  Determines the earliest boundary,
+cancels timers, and locks (keeping `cl::session' intact so the
+interrupted task's marker/title/break-p survive).
+
+With `cl:defer-interrupt-prompt' nil (default), immediately resolves the
+interrupt via `cl::interrupt-resolve' -- the classic behavior, prompting
+right away and requiring a decision (C-g falls back to a keep-minutes
+sub-prompt rather than doing nothing).
+
+With `cl:defer-interrupt-prompt' non-nil, only locks and records the
+interrupt in `cl::pending-interrupt'; the prompt itself is deferred until
+`org-clock-lock-new-session' (bound to \"t\" on the lock screen) calls
+`cl::interrupt-resolve' on it."
   (when (and cl::session (not cl::locked-p))
     (minibuf-ext-when-inactive
      (when (and cl::session (not cl::locked-p))
@@ -1030,73 +1194,15 @@ In every case, one final `message' summarizes what happened."
            (when (timerp ts) (cancel-timer ts))
            (when (timerp ti) (cancel-timer ti)))
          (cl::end-session t)
-         (let* ((prev-marker  (cl::session-marker  cl::session))
-                (prev-title   (cl::session-title   cl::session))
-                (break-p      (cl::session-break-p cl::session))
-                (expand-state (list nil))
-                (choice       (cl::interrupt-pick
-                               kind-label break-p boundary
-                               prev-marker prev-title
-                               expand-state cl:prompt-protect-seconds))
-                (marker   (plist-get choice :marker))
-                (keep     (plist-get choice :keep))
-                (duration (plist-get choice :duration))
-                (cancel-p (plist-get choice :cancel))
-                (resume-p (and marker
-                               (cl::markers-equal-p marker prev-marker)
-                               duration)))
-           (cond
-            (resume-p
-             ;; Resume: same task, no absent time discarded — continue=t
-             ;; so planned minutes accumulate correctly.
-             (cl::begin-session prev-title
-                                (copy-marker prev-marker)
-                                duration
-                                (or keep 0))
-             (message "Resumed \"%s\", +%d min — running until %s"
-                      prev-title duration
-                      (format-time-string
-                       "%H:%M" (time-add (current-time) (seconds-to-time (* duration 60))))))
-
-            (cancel-p
-             (cl::org-clock-cancel)
-             (message "Canceled \"%s\" — nothing logged" prev-title))
-
-            (t
-             ;; Clock out the previous task at the appropriate time.
-             (if (eq keep 'all)
-                 (cl::org-clock-out nil t)
-               (cl::org-clock-out nil t
-                                  (time-add boundary
-                                            (seconds-to-time (* keep 60)))))
-             (if (and marker duration)
-                 (let* ((title (if (markerp marker) (cl::heading-at marker) marker))
-                        (new-marker (if (markerp marker)
-                                        (copy-marker marker)
-                                      (cl::capture-org-task
-                                       title (and (plist-get choice :break-p)
-                                                  '(("BREAK" . "t"))))))
-                        (new-position (plist-get choice :new-position))
-                        (pre-elapsed  (plist-get choice :pre-elapsed))
-                        (start-time (and new-position
-                                         (time-add boundary
-                                                   (seconds-to-time (* new-position 60))))))
-                   (cl::begin-session title new-marker duration pre-elapsed start-time)
-                   (message "Clocked out \"%s\" (%s); clocked into \"%s\"%s, %d min — until %s"
-                            prev-title
-                            (if (eq keep 'all) "kept all" (format "kept %d min" (or keep 0)))
-                            title
-                            (if (and pre-elapsed (> pre-elapsed 0))
-                                (format " (started %d min ago)" pre-elapsed)
-                              "")
-                            duration
-                            (format-time-string
-                             "%H:%M"
-                             (time-add (or start-time (current-time))
-                                       (seconds-to-time (* duration 60))))))
-               (message "Clocked out \"%s\" (%s); staying locked"
-                        prev-title
-                        (if (eq keep 'all) "kept all" (format "kept %d min" (or keep 0)))))))))))))
+         (if cl:defer-interrupt-prompt
+             (progn
+               (setq cl::pending-interrupt (cons kind-label boundary))
+               (message "%s since %s — locked; %s to resolve \"%s\""
+                        kind-label
+                        (format-time-string "%H:%M" boundary)
+                        (substitute-command-keys "\\[org-clock-lock-new-session]")
+                        (cl::session-title cl::session)))
+           (cl::interrupt-resolve kind-label boundary)))))))
 
 ;;; Org-clock integration
 
@@ -1712,6 +1818,11 @@ Session end
                  boundary.  Call `cl:on-sleep' from a system-sleep hook
                  for a precise boundary.
 
+With `cl:defer-interrupt-prompt' non-nil, an interrupt only locks the
+screen instead of also opening the prompt; \"t\" then resolves it (same
+prompt, covering the old task's fate and the new one), and a bare C-g at
+that picker is a clean no-op instead of forcing a decision.
+
 Startup: adopts a running org clock if one exists."
   :global t :lighter " 🔒"
   (if cl:mode
@@ -1741,7 +1852,8 @@ Startup: adopts a running org clock if one exists."
     (cl::remove-header)
     (setq cl::locked-p            nil
           cl::saved-frame-wconfs  nil
-          cl::session             nil)))
+          cl::session             nil
+          cl::pending-interrupt   nil)))
 
 (provide 'org-clock-lock)
 
