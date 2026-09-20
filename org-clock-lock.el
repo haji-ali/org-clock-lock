@@ -42,6 +42,24 @@ integer: seconds of silence before warning (no grace period)."
   :type '(choice (const  :tag "Disabled" nil)
                  (natnum :tag "Warn seconds (no grace)")))
 
+(defcustom cl:auto-continue-max-gap-minutes nil
+  "Silently continue the interrupted task when its gap is small enough.
+nil: disabled -- every idle or sleep interrupt locks the screen and
+opens (or, with `cl:defer-interrupt-prompt', defers) the prompt, same
+as always.
+integer: when an idle or sleep interrupt fires with a gap -- the time
+between the idle/sleep boundary and now -- at or under this many
+minutes, the interrupted task's clock entry is silently extended by
+that gap instead: the screen is never locked and no prompt is shown, as
+if the interrupt had not happened at all.  A brief message still notes
+it.  Session expiry (the planned duration legitimately running out) is
+never auto-continued this way, no matter how small the resulting gap
+turns out to be -- that is always a deliberate stopping point, not
+incidental absence, so `cl::interrupt-boundary' resolving to \\='expired
+always goes through the normal locked flow."
+  :type '(choice (const  :tag "Disabled" nil)
+                 (natnum :tag "Max gap minutes")))
+
 (defcustom cl:show-header t
   "Non-nil to show a header-line countdown during active sessions."
   :type 'boolean)
@@ -444,7 +462,7 @@ prompts fire) and ensures `:immediate-finish t' is set in the options plist."
   "Return the org-capture template entry for KEY, or nil."
   (cl-find key org-capture-templates :key #'car :test #'equal))
 
-(defun cl::read-minutes (prompt default &optional base)
+(defun cl::read-minutes (prompt default)
   "Read a session duration in minutes, returning a positive integer.
 PROMPT is displayed before the bracketed default value.
 DEFAULT is returned when the user enters blank input.
@@ -452,52 +470,27 @@ Values above `cl:session-limits' max are rejected with a message.
 Values below `cl:session-limits' min trigger a y-or-n-p confirmation.
 Signals `quit' if the user presses C-g.
 
-BASE, when non-nil, is minutes already elapsed as of now; the returned
-value is always a total counting from that same starting point (from
-now, when BASE is nil), however it was typed (see `cl::parse-duration-spec'
-for the \"N-M\" grammar):
-  \"N\"   — returned as is.
-  \"+N\"  — N minutes from now, so BASE is added.  Only recognized when
-            BASE is non-nil; the prompt advertises it only then.
-  \"N-M\" — N total, counting from M minutes ago instead of from BASE;
-            folded to (or BASE 0)+N-M so it composes with BASE and any
-            caller arithmetic (e.g. duration = result-BASE) exactly like
-            a plain value would.  Unlike a bare \"N\", this always folds
-            — even \"N-0\" differs from plain \"N\" when BASE is set,
-            since it counts from now rather than from BASE.
-A value already at or past BASE offers a y-or-n-p \"clock out?\"
-confirmation instead of being rejected outright — unlike
-`cl::read-switch-duration', which has no \"clock out\" fallback to offer
-and so hard-rejects instead.  Unparsable input re-prompts with an
-explanation instead of silently falling back to DEFAULT."
+Accepts \"N\" or \"N-M\" (see `cl::parse-duration-spec', called with no
+GAP so a \"/O\" part is never offered here): a bare N is returned as is;
+\"N-M\" backdates by M, returning (max 0 (- N M)).  Unparsable input
+re-prompts with an explanation instead of silently falling back to
+DEFAULT."
   (let (result)
     (while (null result)
-      (let* ((raw     (read-string
-                        (format "%s [default: %d min%s]: "
-                                prompt default
-                                (if base
-                                    (format ", >%d, +N from now, N-M started M ago" base)
-                                  ", N-M started M ago"))
-                        nil nil (number-to-string default)))
-             (rel-p   (and base (string-prefix-p "+" raw)))
-             (spec    (unless rel-p (cl::parse-duration-spec raw default nil)))
-             (typed-n (if rel-p (string-to-number (substring raw 1)) (car spec)))
-             (val     (cond
-                       (rel-p (+ base typed-n))
-                       (spec  (if (nth 3 spec)
-                                  (max 0 (+ (or base 0) (nth 0 spec) (- (nth 1 spec))))
-                                (nth 0 spec))))))
+      (let* ((raw  (read-string
+                    (format "%s [default: %d min, N-M started M ago]: "
+                            prompt default)
+                    nil nil (number-to-string default)))
+             (spec (cl::parse-duration-spec raw default nil))
+             (val  (and spec
+                        (if (nth 3 spec)
+                            (max 0 (- (nth 0 spec) (nth 1 spec)))
+                          (nth 0 spec)))))
         (if (not val)
             (progn
-              (message "Can't parse %S as \"N\", \"+N\", or \"N-M\"" raw)
+              (message "Can't parse %S as \"N\" or \"N-M\"" raw)
               (sit-for 1.5))
-          (unless (and base
-                       (<= val base)
-                       (> typed-n 0) ;; If the input is exactly 0, we know to clock out
-                       (not (y-or-n-p
-                             (format "%d minutes already passed — clock out? "
-                                     val))))
-            (setq result (cl::duration-range-check val))))))
+          (setq result (cl::duration-range-check val)))))
     result))
 
 ;;; Task picker
@@ -823,25 +816,31 @@ Resets `cl::last-tick-time' to now before returning."
 
 (defun cl::parse-duration-spec (raw default gap)
   "Parse RAW as \"N\", \"N-M\", or \"N-M/O\".
-DEFAULT is substituted for N when omitted; M and O default to 0.
+DEFAULT is substituted for N when omitted; M defaults to 0.
 GAP, when non-nil, bounds M+O — the two must never claim more than GAP
 — and permits a trailing \"/O\" part.  When GAP is nil, a \"/O\" part is
 rejected as unparsable: there is no gap to credit anything from.
 
+O defaults to 0 (nothing credited) when \"/O\" is omitted entirely.  A
+bare trailing \"/\" with no digits after it — only meaningful when GAP is
+given — instead credits the maximum possible, (- GAP M): a caller can
+offer \"credit everything\" without knowing GAP itself, and without that
+meaning the same thing as an explicit \"/0\".
+
 Returns a list (N M O DASH-P), where DASH-P is non-nil only when RAW
-actually has a \"-M\" part — this lets a caller distinguish a bare \"N\"
-from an explicit \"N-0\", which mean different things once a base gets
-folded in (see `cl::read-minutes').  Returns nil if RAW cannot be parsed
-this way, if a \"/O\" part is present without GAP, or if M+O exceeds
-GAP."
+actually has a \"-M\" part.  Returns nil if RAW cannot be parsed this
+way, if a \"/O\" part is present without GAP, or if M+O exceeds GAP."
   (when (and (string-match
-              "\\`[ \t]*\\([0-9]+\\)?[ \t]*\\(-[ \t]*\\([0-9]+\\)\\)?[ \t]*\\(/[ \t]*\\([0-9]+\\)\\)?[ \t]*\\'"
+              "\\`[ \t]*\\([0-9]+\\)?[ \t]*\\(-[ \t]*\\([0-9]+\\)\\)?[ \t]*\\(/[ \t]*\\([0-9]+\\)?\\)?[ \t]*\\'"
               raw)
              (or gap (not (match-string 4 raw))))
-    (let ((n      (if (match-string 1 raw) (string-to-number (match-string 1 raw)) default))
-          (m      (if (match-string 3 raw) (string-to-number (match-string 3 raw)) 0))
-          (o      (if (match-string 5 raw) (string-to-number (match-string 5 raw)) 0))
-          (dash-p (and (match-string 2 raw) t)))
+    (let* ((n      (if (match-string 1 raw) (string-to-number (match-string 1 raw)) default))
+           (m      (if (match-string 3 raw) (string-to-number (match-string 3 raw)) 0))
+           (o      (cond
+                    ((not (match-string 4 raw)) 0)
+                    ((match-string 5 raw) (string-to-number (match-string 5 raw)))
+                    (t (max 0 (- (or gap 0) m)))))
+           (dash-p (and (match-string 2 raw) t)))
       (when (or (not gap) (<= (+ m o) gap))
         (list n m o dash-p)))))
 
@@ -862,24 +861,33 @@ short confirmation is declined."
          val))
    (t val)))
 
-(defun cl::read-switch-duration (title default gap)
-  "Read a duration spec for switching to TITLE, an alternate task.
+(defun cl::read-task-duration (title default gap)
+  "Read a duration spec for clocking into TITLE after an interrupt.
 DEFAULT is the duration used when nothing is typed.  GAP is the number
 of minutes since the interrupt boundary; all of it is dead time unless
-some is explicitly reassigned.
+some is explicitly credited back.  Used identically whether TITLE is the
+just-interrupted task itself (a same-task continue) or a different one
+(a switch) -- only which marker ends up clocked into differs; see
+`cl::interrupt-pick'.
 
 Accepts \"X\", \"X-N\", or \"X-N/O\" (see `cl::parse-duration-spec'):
   X — total minutes to work on TITLE, counting from its actual start.
   N — TITLE actually started N minutes ago (backdated clock-in).
-  O — of GAP, O minutes are credited back to the task just clocked out
-      instead of staying dead.  N+O must not exceed GAP, so the old and
-      new sessions never overlap.
+  O — of GAP (minus N), O minutes are credited back to the task just
+      clocked out instead of staying dead.  Omitting \"/O\" entirely
+      credits nothing, the default.  A bare trailing \"/\" credits the
+      maximum instead, (- GAP N) -- for a same-task continue with no
+      backdate (\"X/\"), that credits the whole gap, so nothing was ever
+      dead and `cl::interrupt-pick' keeps it a single unbroken clock
+      entry instead of a real clock-out followed by a fresh clock-in.
+      N+O must not exceed GAP, so the old and new sessions never overlap.
 
 Returns a list (VALUE N O), or nil on C-g.  Unparsable input, or input
 violating the N+O<=GAP or `cl:session-limits' bounds, re-prompts with an
-explanation rather than silently falling back to a default.  Unlike
-`cl::read-minutes', an already-elapsed total is always a hard reject —
-there is no \"clock out\" fallback once a new task has been picked."
+explanation rather than silently falling back to a default.  An
+already-elapsed total (X<=N) is always a hard reject -- there is no
+\"just clock out\" fallback here; C-g at the top-level task picker is
+that fallback instead."
   (let (result)
     (while (null result)
       (let ((raw (condition-case nil
@@ -887,7 +895,7 @@ there is no \"clock out\" fallback once a new task has been picked."
                       (format "Work on \"%s\" for [default: %d min%s]: "
                               title default
                               (if (> gap 0)
-                                  (format "; -N backdate, /O credit old, %dm since interrupt" gap)
+                                  (format "; -N backdate, /O credit old (bare / = all), %dm since interrupt" gap)
                                 ""))
                       nil nil (number-to-string default))
                    (quit :quit))))
@@ -948,22 +956,33 @@ ABORT-ON-QUIT fired, where:
   :break-p      — break-filter state in effect when :marker was committed; used
                   to tag a freshly typed title (a new task) with a BREAK property
   :new-position — minutes past BOUNDARY at which the new session actually
-                  started, when :marker differs from PREV-MARKER (nil
-                  otherwise); the gap between :keep and :new-position is
+                  started; the gap between :keep and :new-position is
                   unaccounted dead time, credited to neither task
   :pre-elapsed  — minutes of the new session already elapsed before the
                   duration prompt, i.e. how far :new-position is behind now
   :cancel       — non-nil when C-c C-k canceled the old session outright
                   (`org-clock-cancel'; nothing logged) instead of clocking out
 
-Special case: when :marker equals PREV-MARKER and :keep is \\='all, the old
-session is resumed for :duration minutes without clocking out.
+Special case: when :marker equals PREV-MARKER and :keep is \\='all, the
+old session is resumed for :duration minutes without clocking out --
+one unbroken clock entry, nothing logged as having ended.  Reached two
+ways: the silent-resume fast path below (time still remaining on the
+old timer, no prompt at all), or the duration prompt itself when it
+turns out the same task was picked and the whole gap ends up credited
+back to it (an empty \"/\", with no backdate) -- since then nothing was
+ever dead, there is nothing to split into two entries for.
 
-When :marker differs from PREV-MARKER, the duration sub-prompt
-(`cl::read-switch-duration') collects :keep, :new-position, and
-:pre-elapsed together via a single \"X\", \"X-N\", or \"X-N/O\" spec: N
-backdates the new task's start, O credits part of the gap back to the old
-task, and the rest of the gap (since BOUNDARY) stays dead by default.
+Any other pick, whether :marker equals PREV-MARKER (a same-task
+continue that doesn't cover the whole gap) or not (a switch), goes
+through the same duration sub-prompt (`cl::read-task-duration'), which
+collects :keep, :new-position, and :pre-elapsed together via a single
+\"X\", \"X-N\", or \"X-N/O\" spec: N backdates the new clock-in's start, O
+credits part of the gap back to the task just clocked out, and the rest
+of the gap (since BOUNDARY) stays dead by default.  This clocks the old
+entry out for real and starts a fresh clock-in -- for a same-task pick,
+that only happens when some of the gap is left dead or backdated into
+the new entry; crediting all of it back collapses into the special case
+above instead.
 
 C-g at any sub-prompt (keep-minutes, duration) returns to the task picker.
 The function loops until the user commits a fully resolved choice."
@@ -1064,36 +1083,32 @@ The function loops until the user commits a fully resolved choice."
                 (setq result (list :marker marker :keep 'all
                                    :duration (round (/ remaining 60))
                                    :break-p (car break-state)))
-              (let ((base (max 0 (round
-                                  (/ (float-time
-                                      (time-subtract (current-time) boundary))
-                                     60)))))
-                (if same-p
-                    (let ((mins (ignore-error quit
-                                  (cl::read-minutes
-                                   (format "Continue \"%s\" for" title)
-                                   default-mins base))))
-                      ;; nil mins = C-g at duration prompt → loop back to task picker
-                      (when mins
-                        (setq result
-                              (if (<= mins base)
-                                  ;; Clock-out
-                                  (list :marker nil :keep mins :duration nil)
-                                (list :marker marker :keep base
-                                      :duration (- mins base)
-                                      :break-p (car break-state))))))
-                  ;; ── Different task: single backdate+credit prompt ────────
-                  (let ((spec (cl::read-switch-duration title default-mins base)))
-                    ;; nil spec = C-g at duration prompt → loop back to task picker
-                    (when spec
-                      (pcase-let ((`(,mins ,n ,o) spec))
-                        (setq result
-                              (list :marker marker
-                                    :keep o
-                                    :new-position (- base n)
-                                    :duration (- mins n)
-                                    :pre-elapsed n
-                                    :break-p (car break-state))))))))))))))
+              ;; Same task or different, the duration prompt is identical.
+              (let* ((base (max 0 (round
+                                   (/ (float-time
+                                       (time-subtract (current-time) boundary))
+                                      60))))
+                     (spec (cl::read-task-duration title default-mins base)))
+                ;; nil spec = C-g at duration prompt → loop back to task picker
+                (when spec
+                  (pcase-let ((`(,mins ,n ,o) spec))
+                    (setq result
+                          (if (and same-p (>= o base))
+                              ;; Same task, whole gap credited (n is then
+                              ;; necessarily 0, since n+o can't exceed
+                              ;; base) -- nothing was ever dead, so this
+                              ;; stays one unbroken clock entry instead of
+                              ;; a real clock-out followed by a fresh
+                              ;; clock-in.
+                              (list :marker marker :keep 'all
+                                    :duration mins
+                                    :break-p (car break-state))
+                            (list :marker marker
+                                  :keep o
+                                  :new-position (- base n)
+                                  :duration (- mins n)
+                                  :pre-elapsed n
+                                  :break-p (car break-state)))))))))))))
     (unless (eq result :abort) result)))
 
 (defun cl::interrupt-dispatch (choice prev-marker prev-title boundary)
@@ -1104,7 +1119,14 @@ to.  Clears `cl::pending-interrupt' first, since committing any CHOICE
 resolves it.  Dispatches:
 
   Same marker, :keep \\='all — resume: re-arm the session for :duration
-                              minutes without clocking out.
+                              minutes without clocking out.  Produced
+                              either by the silent-resume fast path in
+                              `cl::interrupt-pick' (time still remaining,
+                              no prompt at all) or by the duration prompt
+                              itself when a same-task pick ends up
+                              crediting the whole gap back -- either way
+                              nothing was ever dead, so this stays one
+                              unbroken clock entry.
   :cancel                  — discard the old session outright via
                               `org-clock-cancel' (nothing logged), stay locked.
   :marker nil, :keep K      — clock out at boundary+K (or now if K=\\='all),
@@ -1112,7 +1134,9 @@ resolves it.  Dispatches:
   Otherwise                — clock out at boundary+K (or now), clock into
                               :marker at boundary+:new-position (or now, if
                               :new-position is nil) for :duration minutes.
-                              Any gap between the two is unaccounted dead time.
+                              Any gap between the two is unaccounted dead
+                              time.  Covers both a genuinely different task
+                              and a same-task continue picked manually.
 
 In every case, one final `message' summarizes what happened."
   (setq cl::pending-interrupt nil)
@@ -1122,7 +1146,8 @@ In every case, one final `message' summarizes what happened."
          (cancel-p (plist-get choice :cancel))
          (resume-p (and marker
                         (cl::markers-equal-p marker prev-marker)
-                        duration)))
+                        duration
+                        (eq keep 'all))))
     (cond
      (resume-p
       ;; Resume: same task, no absent time discarded — continue=t
@@ -1205,12 +1230,47 @@ session has begun since."
     (when choice
       (cl::interrupt-dispatch choice prev-marker prev-title boundary))))
 
+(defun cl::maybe-auto-continue (kind boundary)
+  "Silently extend the current session instead of locking, if eligible.
+Return non-nil (having already done so) when `cl:auto-continue-max-gap-minutes'
+is set, KIND is not \\='expired, and the gap between BOUNDARY and now is at
+or under that many minutes; return nil (having done nothing) otherwise,
+leaving `cl::interrupt-prompt' to lock and prompt as usual.
+
+On success, the session/idle timers are re-armed via `cl::begin-session'
+exactly as `cl::interrupt-pick''s own SILENT-RESUME-P fast path does for
+a manual same-task pick with time still remaining -- CONTINUE is passed
+as \\='all, not a number, so :planned-minutes grows by only the forward
+duration passed, the same as that path, and the org clock itself is
+never touched, since it was never stopped to begin with.  When the
+gap outlasted the session's own remaining time too (e.g. a sleep longer
+than what was left), the forward duration falls back to the gap itself
+rounded up to whole minutes, so the session still gets at least that
+much time going forward.  A brief message notes what happened."
+  (when (and cl:auto-continue-max-gap-minutes
+             (not (eq kind 'expired))
+             cl::session)
+    (let ((gap-minutes (/ (float-time (time-subtract (current-time) boundary)) 60.0)))
+      (when (<= gap-minutes cl:auto-continue-max-gap-minutes)
+        (let* ((remaining (cl::secs-remaining))
+               (fwd-mins  (if (> remaining 0)
+                               (round (/ remaining 60))
+                             (max 1 (ceiling gap-minutes))))
+               (title     (cl::session-title cl::session))
+               (marker    (cl::session-marker cl::session)))
+          (cl::begin-session title (copy-marker marker) fwd-mins 'all)
+          (message "%s — continued automatically (%d min gap credited)"
+                   title (ceiling gap-minutes))
+          t)))))
+
 (defun cl::interrupt-prompt ()
   "Unified session interrupt handler for idle/sleep/expiry.
 
-Defers until no minibuffer is active.  Determines the earliest boundary,
-cancels timers, and locks (keeping `cl::session' intact so the
-interrupted task's marker/title/break-p survive).
+Defers until no minibuffer is active.  Determines the earliest boundary
+and, unless `cl::maybe-auto-continue' silently handles it (small gap,
+see `cl:auto-continue-max-gap-minutes'), cancels timers and locks
+(keeping `cl::session' intact so the interrupted task's marker/title/
+break-p survive).
 
 With `cl:defer-interrupt-prompt' nil (default), immediately resolves the
 interrupt via `cl::interrupt-resolve' -- the classic behavior, prompting
@@ -1224,31 +1284,33 @@ interrupt in `cl::pending-interrupt'; the prompt itself is deferred until
   (when (and cl::session (not cl::locked-p))
     (minibuf-ext-when-inactive
      (when (and cl::session (not cl::locked-p))
-       (let* ((kbnd       (or (cl::interrupt-boundary)
-                              (cons 'expired (current-time))))
-              (kind       (car kbnd))
-              (boundary   (cdr kbnd))
-              (kind-label (pcase kind
-                            ('idle    "Idle")
-                            ('sleep   "Asleep")
-                            ('expired "Expired"))))
-         (let ((ts (cl::session-timer-session cl::session))
-               (ti (cl::session-timer-idle    cl::session)))
-           (when (timerp ts) (cancel-timer ts))
-           (when (timerp ti) (cancel-timer ti)))
-         ;; Set before locking (not just for the defer branch) so the lock
-         ;; buffer's status line (`cl::lock-status-line') has something to
-         ;; read from its very first render, even in the immediate-prompt
-         ;; case below where it's normally covered right away by the prompt.
-         (setq cl::pending-interrupt (cons kind-label boundary))
-         (cl::end-session t)
-         (if cl:defer-interrupt-prompt
-             (message "%s since %s — locked; %s to resolve \"%s\""
-                      kind-label
-                      (format-time-string "%H:%M" boundary)
-                      (substitute-command-keys "\\[org-clock-lock-new-session]")
-                      (cl::session-title cl::session))
-           (cl::interrupt-resolve kind-label boundary)))))))
+       (let* ((kbnd     (or (cl::interrupt-boundary)
+                            (cons 'expired (current-time))))
+              (kind     (car kbnd))
+              (boundary (cdr kbnd)))
+         (unless (cl::maybe-auto-continue kind boundary)
+           (let ((kind-label (pcase kind
+                               ('idle    "Idle")
+                               ('sleep   "Asleep")
+                               ('expired "Expired"))))
+             (let ((ts (cl::session-timer-session cl::session))
+                   (ti (cl::session-timer-idle    cl::session)))
+               (when (timerp ts) (cancel-timer ts))
+               (when (timerp ti) (cancel-timer ti)))
+             ;; Set before locking (not just for the defer branch) so the
+             ;; lock buffer's status line (`cl::lock-status-line') has
+             ;; something to read from its very first render, even in the
+             ;; immediate-prompt case below where it's normally covered
+             ;; right away by the prompt.
+             (setq cl::pending-interrupt (cons kind-label boundary))
+             (cl::end-session t)
+             (if cl:defer-interrupt-prompt
+                 (message "%s since %s — locked; %s to resolve \"%s\""
+                          kind-label
+                          (format-time-string "%H:%M" boundary)
+                          (substitute-command-keys "\\[org-clock-lock-new-session]")
+                          (cl::session-title cl::session))
+               (cl::interrupt-resolve kind-label boundary)))))))))
 
 ;;; Org-clock integration
 

@@ -99,14 +99,35 @@ time since the interrupt boundary:
 
 | Action | Result |
 |--------|--------|
-| Pick the **same task** | Resume: the absent time is counted as work. If enough session time remains the timer re-arms silently; otherwise you are asked for a new duration. |
-| Pick a **different task** | The previous task is clocked out at the boundary (absent time is not counted). Enter the new session length and the new task starts immediately. |
+| Pick the **same task** and it still has time remaining on its own timer | Resume: re-arms silently, no prompt, no time lost, one unbroken clock entry. |
+| Pick the **same task** otherwise, and credit the whole gap back (`X/`) | Resume: one unbroken clock entry, same as above — nothing was ever dead, so there's nothing to split. |
+| Pick the **same task** and credit only part of the gap, or a **different task** | Enter a duration (see below). The previous task is clocked out at the boundary, crediting back only what you ask for; the picked task then gets a fresh clock-in. |
 | `C-g` | Exclude: prompted for minutes to keep (default 0). The previous task is clocked out at boundary + keep-minutes. Emacs stays locked. |
 | `C-c C-e` | Keep all: clock out at the current time (all absent time counted as work). Emacs stays locked. |
+
+The duration prompt accepts `X`, `X-N`, or `X-N/O`:
+
+- `X` — total minutes to work on the picked task, counting from its actual start.
+- `N` — the picked task actually started `N` minutes ago (backdated clock-in).
+- `O` — of the gap since the interrupt, `O` minutes are credited back to the
+  task just clocked out instead of staying dead. Omitting `/O` credits
+  nothing, the default. A bare trailing `/` credits the maximum possible
+  instead — for a same-task pick with no backdate (`X/`), that's the whole
+  gap, so no time is lost and the task stays one unbroken clock entry
+  instead of a real clock-out followed by a fresh clock-in.
 
 When multiple interrupts overlap — for example, the session expires during a
 sleep — the earliest boundary is used, so the retroactive clock-out option
 always reaches back to when you last actively worked.
+
+### Auto-continuing small gaps
+
+Set `org-clock-lock-auto-continue-max-gap-minutes` to a number of minutes to
+skip locking altogether for a short idle or sleep gap: if the gap is at or
+under that threshold, the interrupted task's clock entry is silently
+extended and a brief message notes it — no lock screen, no prompt. Session
+expiry is never auto-continued this way, no matter how small the resulting
+gap, since running out the timer is always a deliberate stopping point.
 
 ### Sleep detection
 
@@ -167,6 +188,7 @@ appeared unannounced, is skipped in this mode.
 | `org-clock-lock-session-limits` | `(2 . 120)` | Min/max session length |
 | `org-clock-lock-session-warn-seconds` | 120 | Header urgency threshold |
 | `org-clock-lock-idle-warn-seconds` | 300 | Idle detection threshold (`nil` to disable) |
+| `org-clock-lock-auto-continue-max-gap-minutes` | `nil` | Silently continue instead of locking when an idle/sleep gap is at or under this many minutes |
 | `org-clock-lock-sleep-detect-seconds` | 10 | Tick gap that signals sleep |
 | `org-clock-lock-clock-out-on-sleep` | `nil` | Auto clock-out on sleep without prompting |
 | `org-clock-lock-defer-interrupt-prompt` | `nil` | Lock without prompting on interrupt; resolve later via `t` |
