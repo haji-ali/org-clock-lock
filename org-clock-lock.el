@@ -112,14 +112,21 @@ same as always) until you press \"t\" on the lock screen or invoke
 `org-clock-lock-new-session' -- at that point the same prompt appears,
 covering both what to do with the old task (resume, backdate, credit
 time back to it, cancel it) and which new task to start, exactly as if
-the interrupt had just happened.
+the interrupt had just happened.  Press \"c\" instead to resume that same
+old task directly, skipping the picker.  While the interrupt sits
+unresolved, the lock screen shows a status line naming the old task, why
+it was interrupted, and since when.
 
 In this mode, C-g at the top-level task picker does not force a
 decision: it silently cancels back to the plain lock screen, leaving
 the old task's fate undecided and nothing clocked out, so you can defer
 again and revisit later.  This differs from the immediate-prompt case,
 where C-g instead opens a \"minutes to keep\" sub-prompt, since an
-already-fired live interrupt requires a resolution."
+already-fired live interrupt requires a resolution.  Also unlike the
+immediate-prompt case, `cl:prompt-protect-seconds' keystroke protection
+is skipped here: that protection exists for a prompt that appears
+unannounced, and resolving here is always something you asked for by
+pressing \"t\" or \"c\" on a screen you were already looking at."
   :type 'boolean)
 
 
@@ -141,12 +148,14 @@ already-fired live interrupt requires a resolution."
   (let ((m (make-sparse-keymap)))
     (define-key m [remap save-buffer] #'ignore)
     (define-key m (kbd "t") #'cl::agenda-new-session)
+    (define-key m (kbd "c") #'cl::agenda-resume-task)
     (define-key m (kbd "g") #'cl::agenda-redo)
     (define-key m (kbd "r") #'cl::agenda-redo)
     m)
   "Keymap layered over `org-agenda-mode-map' in the lock screen buffer.
 Shadows the agenda's own \"t\", since in this buffer it picks a task
-instead of cycling a TODO state.")
+instead of cycling a TODO state.  Also shadows \"c\", used here to
+resume a pending interrupted task directly (see `cl::agenda-resume-task').")
 
 (defvar cl::log-line-map
   (let ((m (make-sparse-keymap)))
@@ -732,6 +741,23 @@ to do with the interrupted task alongside picking the next one."
             (cl::begin-session title (copy-marker marker) mins))))
       (cl:new-session))))
 
+(defun cl::agenda-resume-task ()
+  "Resume the pending interrupted task, skipping the task picker.
+Mirrors the fast path `cl::agenda-new-session' offers for a task at
+point (\"t\"): jumps straight to the duration prompt, here for the
+interrupted task itself rather than whatever is at point.  Only
+meaningful when `cl::pending-interrupt' is set (see
+`cl:defer-interrupt-prompt'); with nothing pending, this is a no-op with
+a message.  The plain task picker (`org-clock-lock-new-session', \"t\")
+remains available to switch to a different task instead."
+  (interactive)
+  (if cl::pending-interrupt
+      (cl::interrupt-resolve (car cl::pending-interrupt)
+                             (cdr cl::pending-interrupt)
+                             t
+                             (cl::session-marker cl::session))
+    (message "No interrupted task to resume")))
+
 ;;; Timers
 (defun cl::tick ()
   "1-second heartbeat: refresh the header and detect sleep/wake cycles.
@@ -883,7 +909,7 @@ there is no \"clock out\" fallback once a new task has been picked."
 
 (defun cl::interrupt-pick (kind-label break-p boundary prev-marker prev-title
                                       expand-state protect-seconds
-                                      &optional abort-on-quit)
+                                      &optional abort-on-quit preselect-marker)
   "Interactively collect the user's full interrupt response.
 
 KIND-LABEL is the display string for what triggered the interrupt
@@ -905,6 +931,14 @@ backing out costs nothing -- no decision is forced, nothing is clocked
 out.  C-g at a duration sub-prompt still just loops back to the task
 picker either way (see below), so this only changes what a *second*,
 top-level C-g does.
+
+PRESELECT-MARKER, when non-nil, skips the interactive picker on the
+first iteration of the loop and behaves as though that marker had just
+been picked -- used by `cl::agenda-resume-task' to jump straight to the
+duration prompt for the interrupted task itself, the same fast path
+`cl::agenda-new-session' offers for a task at point.  Only consulted
+once: a C-g out of the resulting duration prompt loops back to the
+ordinary interactive picker rather than re-offering the same marker.
 
 Returns a plist (:marker M :keep K :duration D :break-p B), or nil if
 ABORT-ON-QUIT fired, where:
@@ -933,12 +967,14 @@ task, and the rest of the gap (since BOUNDARY) stays dead by default.
 
 C-g at any sub-prompt (keep-minutes, duration) returns to the task picker.
 The function loops until the user commits a fully resolved choice."
-  (let (result (break-state (list break-p)))
+  (let (result (break-state (list break-p)) (preselect preselect-marker))
     (while (null result)
       (let* ((keep-all nil)
              (cancel-p nil)
              (marker
-              (condition-case nil
+              (if preselect
+                  (prog1 preselect (setq preselect nil))
+                (condition-case nil
                   (minibuf-ext-with-live-prompt
                    (lambda ()
                      (let* ((secs (max 0 (round (float-time
@@ -972,7 +1008,7 @@ The function loops until the user commits a fully resolved choice."
                                         (setq cancel-p t)
                                         (abort-recursive-edit))))
                       (cl:read-task nil break-p expand-state break-state))))
-                (quit nil))))
+                (quit nil)))))
         ;; Protection only applies on the first invocation of the picker
         (setq protect-seconds nil)
         (cond
@@ -1140,13 +1176,20 @@ In every case, one final `message' summarizes what happened."
                  prev-title
                  (if (eq keep 'all) "kept all" (format "kept %d min" (or keep 0)))))))))
 
-(defun cl::interrupt-resolve (kind-label boundary &optional abort-on-quit)
+(defun cl::interrupt-resolve (kind-label boundary &optional abort-on-quit preselect-marker)
   "Run the interrupt picker against the still-locked `cl::session' and dispatch.
 KIND-LABEL and BOUNDARY describe the interrupt (see `cl::interrupt-pick').
 ABORT-ON-QUIT is passed through to `cl::interrupt-pick': non-nil makes a
 bare C-g at the top-level task picker a clean no-op instead of forcing a
 keep-minutes decision.  Does nothing (stays locked, `cl::pending-interrupt'
-untouched) when the picker is aborted.
+untouched) when the picker is aborted.  ABORT-ON-QUIT is also used here to
+tell a deliberate, user-initiated resolve (called once the user is already
+looking at the lock screen and pressed a key to act on it) apart from a
+live interrupt firing out of the blue: only the latter needs
+`cl:prompt-protect-seconds' keystroke protection on the picker's first
+invocation, so protection is skipped whenever ABORT-ON-QUIT is set.
+PRESELECT-MARKER is passed through to `cl::interrupt-pick' to skip the
+picker and jump straight to the duration prompt for that marker.
 Assumes `cl::session' still holds the interrupted task's marker/title/
 break-p, i.e. `cl::end-session' was called with KEEP-STATE t and no
 session has begun since."
@@ -1157,8 +1200,8 @@ session has begun since."
          (choice       (cl::interrupt-pick
                         kind-label break-p boundary
                         prev-marker prev-title
-                        expand-state cl:prompt-protect-seconds
-                        abort-on-quit)))
+                        expand-state (unless abort-on-quit cl:prompt-protect-seconds)
+                        abort-on-quit preselect-marker)))
     (when choice
       (cl::interrupt-dispatch choice prev-marker prev-title boundary))))
 
@@ -1193,15 +1236,18 @@ interrupt in `cl::pending-interrupt'; the prompt itself is deferred until
                (ti (cl::session-timer-idle    cl::session)))
            (when (timerp ts) (cancel-timer ts))
            (when (timerp ti) (cancel-timer ti)))
+         ;; Set before locking (not just for the defer branch) so the lock
+         ;; buffer's status line (`cl::lock-status-line') has something to
+         ;; read from its very first render, even in the immediate-prompt
+         ;; case below where it's normally covered right away by the prompt.
+         (setq cl::pending-interrupt (cons kind-label boundary))
          (cl::end-session t)
          (if cl:defer-interrupt-prompt
-             (progn
-               (setq cl::pending-interrupt (cons kind-label boundary))
-               (message "%s since %s — locked; %s to resolve \"%s\""
-                        kind-label
-                        (format-time-string "%H:%M" boundary)
-                        (substitute-command-keys "\\[org-clock-lock-new-session]")
-                        (cl::session-title cl::session)))
+             (message "%s since %s — locked; %s to resolve \"%s\""
+                      kind-label
+                      (format-time-string "%H:%M" boundary)
+                      (substitute-command-keys "\\[org-clock-lock-new-session]")
+                      (cl::session-title cl::session))
            (cl::interrupt-resolve kind-label boundary)))))))
 
 ;;; Org-clock integration
@@ -1726,9 +1772,40 @@ agenda buffer like this one."
   (interactive)
   (cl::refresh-lock-buffer))
 
+(defun cl::lock-status-line ()
+  "Return a propertized preamble line describing why the screen is locked.
+Non-nil only while `cl::pending-interrupt' is set, i.e. an interrupt
+\(idle, sleep, or session expiry\) fired but hasn't been resolved yet --
+routine while `cl:defer-interrupt-prompt' is non-nil, since that mode
+leaves the screen locked without opening the resolving prompt itself;
+otherwise only a brief transient before `cl::interrupt-resolve' covers
+the screen with that prompt.
+Reports the interrupted task, what triggered the interrupt and when, and
+that the underlying org clock is still running behind the lock screen
+\(frozen accounting at the interrupt boundary, per
+`cl:defer-interrupt-prompt', but not actually clocked out\) until
+resolved via `org-clock-lock-new-session' or `cl::agenda-resume-task'."
+  (when cl::pending-interrupt
+    (let* ((kind-label (car cl::pending-interrupt))
+           (boundary   (cdr cl::pending-interrupt))
+           (title      (or (and cl::session (cl::session-title cl::session))
+                           "?"))
+           (secs       (max 0 (round (float-time
+                                      (time-subtract (current-time) boundary))))))
+      (propertize
+       (format "  🔒 Clocked in: \"%s\" — %s since %s (%d:%02d) — t to resolve, c to resume\n\n"
+               title kind-label (format-time-string "%H:%M" boundary)
+               (/ secs 60) (% secs 60))
+       'face 'org-warning))))
+
 (defun cl::agenda-finalize ()
   "Finalized lock buffer."
   (when (equal (buffer-name) cl::buf)
+    (when-let* ((status (cl::lock-status-line)))
+      (let ((inhibit-read-only t))
+        (save-excursion
+          (goto-char (point-min))
+          (insert status))))
     (cl::agenda-lock-minor-mode 1)))
 
 (defun cl::refresh-lock-buffer ()
@@ -1802,7 +1879,8 @@ LOCKED   Full-frame lock screen: an org-agenda buffer, built by
          `cl:agenda-command' (customize it to add
          `org-clock-lock-agenda-log-block' or a clock report).
          `cl:locked-map' blocks navigation and buffer commands;
-         \"t\" picks a task.
+         \"t\" picks a task, \"c\" resumes a pending interrupted task
+         directly.
 
 UNLOCKED Normal Emacs with optional header-line countdown.
          Break tasks (BREAK property) skip idle detection.
@@ -1819,9 +1897,11 @@ Session end
                  for a precise boundary.
 
 With `cl:defer-interrupt-prompt' non-nil, an interrupt only locks the
-screen instead of also opening the prompt; \"t\" then resolves it (same
-prompt, covering the old task's fate and the new one), and a bare C-g at
-that picker is a clean no-op instead of forcing a decision.
+screen instead of also opening the prompt, showing a status line with the
+old task, why it was interrupted, and since when; \"t\" then resolves it
+(same prompt, covering the old task's fate and the new one), \"c\" resumes
+the old task directly, and a bare C-g at the picker is a clean no-op
+instead of forcing a decision.
 
 Startup: adopts a running org clock if one exists."
   :global t :lighter " 🔒"

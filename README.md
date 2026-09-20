@@ -35,11 +35,12 @@ option to adopt it as the current session.
 
 ## The lock screen
 
-When locked, Emacs shows a full-frame buffer with two action keys:
+When locked, Emacs shows a full-frame buffer with these action keys:
 
 | Key   | Action                                    |
 |-------|-------------------------------------------|
 | `t`   | Pick a task and start working             |
+| `c`   | Resume the pending interrupted task directly, skipping the picker (see below) |
 | `TAB` | Collapse/expand the day log               |
 
 Navigation and buffer commands (`C-x b`, `C-x k`, `find-file`, window
@@ -137,14 +138,25 @@ plain lock screen on interrupt, without opening the prompt. The old clock
 keeps running, frozen at the interrupt boundary, until you press `t` (or
 otherwise start a new session) — at that point the same prompt appears,
 covering both what to do with the interrupted task and which task to start
-next, exactly as if the interrupt had just happened.
+next, exactly as if the interrupt had just happened. Pressing `c` instead
+resumes that same task directly, skipping the picker — a shortcut for the
+common case where you just want to keep working on what you were doing.
+
+While an interrupt is pending, the lock screen shows a status line naming
+the interrupted task, what triggered the interrupt (`Expired`, `Idle`, or
+`Asleep`) and since when, since this is otherwise invisible with the
+prompt deferred.
 
 In this mode, `C-g` at the task picker doesn't force a decision — it's a
 clean no-op back to the plain lock screen, nothing clocked out, so you can
 leave the interrupt unresolved and come back to it later. (This differs
 from the immediate-prompt case above, where `C-g` opens the "minutes to
 keep" sub-prompt instead, since a live interrupt has already happened and
-needs a resolution.)
+needs a resolution.) Because resolving the prompt here is always something
+you deliberately asked for — either by pressing `t`/`c` on a screen you're
+already looking at — `org-clock-lock-prompt-protect-seconds` keystroke
+protection, which exists to stop stray keystrokes from a prompt that
+appeared unannounced, is skipped in this mode.
 
 ## Customisation
 
