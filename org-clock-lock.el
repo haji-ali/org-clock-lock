@@ -488,10 +488,14 @@ mechanism Vertico itself uses for its candidates overlay (including the
 FRONT-ADVANCE/REAR-ADVANCE t t on `make-overlay', which pins the
 zero-width overlay at the insertion point so it advances correctly the
 instant text is typed, ahead of the next `post-command-hook' run rather
-than relying on that alone).  A buffer-local `minibuffer-exit-hook'
-deletes it when the prompt exits, since the minibuffer buffer is reused
-across prompts and a leftover overlay would otherwise linger into the
-next one."
+than relying on that alone) and the leading `cursor t' text property on
+the `before-string' (also lifted from Vertico), which is what keeps the
+terminal cursor rendered at the actual input position instead of after
+the whole overlay -- without it, point sitting at the overlay's
+position renders the cursor below the help text instead.  A
+buffer-local `minibuffer-exit-hook' deletes the overlay when the prompt
+exits, since the minibuffer buffer is reused across prompts and a
+leftover overlay would otherwise linger into the next one."
   (let ((map (make-sparse-keymap))
         ov reposition)
     (set-keymap-parent map (current-local-map))
@@ -509,8 +513,17 @@ next one."
                              (setq ov nil)
                              (remove-hook 'post-command-hook reposition t))
                     (setq ov (make-overlay (point-max) (point-max) nil t t))
+                    ;; Leading #(" " 0 1 (cursor t)) marks where redisplay
+                    ;; should actually draw the cursor -- without it, point
+                    ;; sitting at the overlay's position (the end of the
+                    ;; input) renders the cursor after the whole
+                    ;; before-string instead, i.e. below the help text.
+                    ;; Same fix Vertico applies to its own candidates
+                    ;; overlay, for the same reason.
                     (overlay-put ov 'before-string
-                                 (propertize (concat "\n" text) 'face 'shadow))
+                                 (concat #(" " 0 1 (cursor t))
+                                         (propertize (concat "\n" text)
+                                                     'face 'shadow)))
                     (add-hook 'post-command-hook reposition nil t))))
     (use-local-map map)))
 
