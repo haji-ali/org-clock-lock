@@ -463,7 +463,14 @@ prompts fire) and ensures `:immediate-finish t' is set in the options plist."
   (cl-find key org-capture-templates :key #'car :test #'equal))
 
 (defun cl::minibuffer-bind-help (key text)
-  "Bind KEY, in the active minibuffer, to show TEXT via `minibuffer-message'.
+  "Bind KEY, in the active minibuffer, to toggle a persistent display of
+TEXT below the current input -- the minibuffer window grows to fit it,
+the same way a completion UI like Vertico expands the minibuffer to show
+its candidate list below the prompt, just with fixed content here
+instead of live candidates.  Unlike `minibuffer-message', the text stays
+up (and the window stays grown) across further keystrokes, until KEY is
+pressed again or the prompt exits.
+
 Call from a `minibuffer-with-setup-hook' function.  Installs a fresh
 child keymap parented to whatever local map is already active rather
 than mutating that map in place -- the active map for a plain
@@ -472,10 +479,39 @@ itself, a single object shared across every such call in the session,
 so binding KEY directly on it would leak into unrelated prompts
 elsewhere; a child keymap keeps the binding local to this one
 minibuffer session while still falling through to every other binding
-via the parent."
-  (let ((map (make-sparse-keymap)))
+via the parent.
+
+The display itself is a zero-width overlay at (point-max) carrying a
+`before-string', repositioned via a buffer-local `post-command-hook' so
+it stays trailing the input as it grows or shrinks -- the exact
+mechanism Vertico itself uses for its candidates overlay (including the
+FRONT-ADVANCE/REAR-ADVANCE t t on `make-overlay', which pins the
+zero-width overlay at the insertion point so it advances correctly the
+instant text is typed, ahead of the next `post-command-hook' run rather
+than relying on that alone).  A buffer-local `minibuffer-exit-hook'
+deletes it when the prompt exits, since the minibuffer buffer is reused
+across prompts and a leftover overlay would otherwise linger into the
+next one."
+  (let ((map (make-sparse-keymap))
+        ov reposition)
     (set-keymap-parent map (current-local-map))
-    (define-key map key (lambda () (interactive) (minibuffer-message text)))
+    (setq reposition
+          (lambda ()
+            (when (overlayp ov) (move-overlay ov (point-max) (point-max)))))
+    (add-hook 'minibuffer-exit-hook
+              (lambda () (when (overlayp ov) (delete-overlay ov)))
+              nil t)
+    (define-key map key
+                (lambda ()
+                  (interactive)
+                  (if (overlayp ov)
+                      (progn (delete-overlay ov)
+                             (setq ov nil)
+                             (remove-hook 'post-command-hook reposition t))
+                    (setq ov (make-overlay (point-max) (point-max) nil t t))
+                    (overlay-put ov 'before-string
+                                 (propertize (concat "\n" text) 'face 'shadow))
+                    (add-hook 'post-command-hook reposition nil t))))
     (use-local-map map)))
 
 (defun cl::read-minutes (prompt default)
@@ -491,8 +527,8 @@ GAP so a \"/O\" part is never offered here): a bare N is returned as is;
 \"N-M\" backdates by M, returning (max 0 (- N M)).  Unparsable input
 re-prompts with an explanation instead of silently falling back to
 DEFAULT.  Press \"?\" at the prompt for a fuller explanation of the
-syntax, shown via `minibuffer-message' rather than crowding the prompt
-itself."
+syntax (see `cl::minibuffer-bind-help'), toggled below the prompt
+instead of crowding it."
   (let (result)
     (while (null result)
       (let* ((raw  (minibuffer-with-setup-hook
@@ -913,8 +949,8 @@ explanation rather than silently falling back to a default.  An
 already-elapsed total (X<=N) is always a hard reject -- there is no
 \"just clock out\" fallback here; C-g at the top-level task picker is
 that fallback instead.  Press \"?\" at the prompt for a fuller
-explanation of the syntax, shown via `minibuffer-message' rather than
-crowding the prompt itself."
+explanation of the syntax (see `cl::minibuffer-bind-help'), toggled
+below the prompt instead of crowding it."
   (let (result)
     (while (null result)
       (let ((raw (condition-case nil

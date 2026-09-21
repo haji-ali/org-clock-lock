@@ -117,8 +117,10 @@ The duration prompt accepts `X`, `X-N`, or `X-N/O`:
   instead of a real clock-out followed by a fresh clock-in.
 
 Press `?` at either this or the plain duration prompt (e.g. when picking a
-task from the lock screen) for a fuller explanation of the syntax, shown as
-a transient message below the prompt rather than crowding it.
+task from the lock screen) to toggle a fuller explanation of the syntax
+below the prompt — the minibuffer expands to fit it, similar to how a
+completion UI shows its candidate list, and it stays up (press `?` again to
+dismiss it) instead of crowding the prompt line itself.
 
 When multiple interrupts overlap — for example, the session expires during a
 sleep — the earliest boundary is used, so the retroactive clock-out option
