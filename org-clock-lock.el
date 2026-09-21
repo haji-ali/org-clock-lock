@@ -1429,7 +1429,22 @@ Returns non-nil if the clock was adopted, nil if the user declined."
 
 (defun cl::on-clock-out ()
   "Handle `org-clock-out-hook'.
-If still clocked in (task switched), adopt the new clock immediately."
+If still clocked in (task switched), adopt the new clock immediately.
+
+A deferred interrupt (`cl::pending-interrupt') for the task just
+clocked out is resolved by this alone: the user clocked out directly
+\(e.g. plain `org-clock-out'\), bypassing `org-clock-lock-new-session',
+so `cl::pending-interrupt' is cleared here instead of being left stale,
+pointing at a task that is not even clocked in any more.  Unless
+something new got clocked into in the same breath (handled below via
+`cl::adopt-running-clock'), the session is also finalized/logged here,
+since the plain `org-clocking-p'/`cl::locked-p' check below would
+otherwise skip `cl::end-session' entirely on the grounds that the
+screen is already locked."
+  (when cl::pending-interrupt
+    (setq cl::pending-interrupt nil)
+    (unless (org-clocking-p)
+      (cl::end-session)))
   (unless
       (if (org-clocking-p)
           (cl::adopt-running-clock t)
@@ -1920,19 +1935,32 @@ agenda buffer like this one."
   (cl::refresh-lock-buffer))
 
 (defun cl::lock-status-line ()
-  "Return a propertized preamble line describing why the screen is locked.
-Non-nil only while `cl::pending-interrupt' is set, i.e. an interrupt
-\(idle, sleep, or session expiry\) fired but hasn't been resolved yet --
-routine while `cl:defer-interrupt-prompt' is non-nil, since that mode
-leaves the screen locked without opening the resolving prompt itself;
-otherwise only a brief transient before `cl::interrupt-resolve' covers
-the screen with that prompt.
-Reports the interrupted task, what triggered the interrupt and when, and
-that the underlying org clock is still running behind the lock screen
-\(frozen accounting at the interrupt boundary, per
-`cl:defer-interrupt-prompt', but not actually clocked out\) until
-resolved via `org-clock-lock-new-session' or `cl::agenda-resume-task'."
-  (when cl::pending-interrupt
+  "Return a propertized preamble line describing the current clock status.
+Two cases, checked in order:
+
+`cl::pending-interrupt' set -- an interrupt (idle, sleep, or session
+expiry) fired but hasn't been resolved yet, routine while
+`cl:defer-interrupt-prompt' is non-nil, since that mode leaves the
+screen locked without opening the resolving prompt itself; otherwise
+only a brief transient before `cl::interrupt-resolve' covers the screen
+with that prompt.  Reports the interrupted task, what triggered the
+interrupt and when, and that the underlying org clock is still running
+behind the lock screen (frozen accounting at the interrupt boundary,
+per `cl:defer-interrupt-prompt', but not actually clocked out) until
+resolved via `org-clock-lock-new-session' or `cl::agenda-resume-task'.
+
+Otherwise, `org-clocking-p' -- something is clocked in with no
+interrupt pending, e.g. because this buffer was visited directly (it's
+an ordinary buffer once built, not exclusively the full-frame lock
+display) while a session is actively running elsewhere, or a task got
+clocked into by some means org-clock-lock itself didn't initiate.
+Reports that plainly, via org's own `org-clock-heading' rather than
+`cl::session', so it stays accurate even when the latter doesn't
+reflect what is actually clocked in.
+
+Nil in every other case (nothing to report)."
+  (cond
+   (cl::pending-interrupt
     (let* ((kind-label (car cl::pending-interrupt))
            (boundary   (cdr cl::pending-interrupt))
            (title      (or (and cl::session (cl::session-title cl::session))
@@ -1943,7 +1971,11 @@ resolved via `org-clock-lock-new-session' or `cl::agenda-resume-task'."
        (format "  🔒 Clocked in: \"%s\" — %s since %s (%d:%02d) — t to resolve, c to resume\n\n"
                title kind-label (format-time-string "%H:%M" boundary)
                (/ secs 60) (% secs 60))
-       'face 'org-warning))))
+       'face 'org-warning)))
+   ((org-clocking-p)
+    (propertize
+     (format "  ⏱ Clocked in: \"%s\"\n\n" org-clock-heading)
+     'face 'org-agenda-clocking))))
 
 (defun cl::agenda-finalize ()
   "Finalized lock buffer."

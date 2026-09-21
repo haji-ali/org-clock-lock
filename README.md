@@ -172,7 +172,11 @@ common case where you just want to keep working on what you were doing.
 While an interrupt is pending, the lock screen shows a status line naming
 the interrupted task, what triggered the interrupt (`Expired`, `Idle`, or
 `Asleep`) and since when, since this is otherwise invisible with the
-prompt deferred.
+prompt deferred. The same status line, in a plainer form, also appears
+whenever the `*org-clock-lock*` buffer is visited (it's an ordinary buffer
+once built, not exclusively the full-frame lock display) while something is
+clocked in with no interrupt pending — so it's never silently misleading
+about the current clock state.
 
 In this mode, `C-g` at the task picker doesn't force a decision — it's a
 clean no-op back to the plain lock screen, nothing clocked out, so you can
