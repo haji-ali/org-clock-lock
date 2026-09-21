@@ -116,6 +116,10 @@ The duration prompt accepts `X`, `X-N`, or `X-N/O`:
   gap, so no time is lost and the task stays one unbroken clock entry
   instead of a real clock-out followed by a fresh clock-in.
 
+Press `?` at either this or the plain duration prompt (e.g. when picking a
+task from the lock screen) for a fuller explanation of the syntax, shown as
+a transient message below the prompt rather than crowding it.
+
 When multiple interrupts overlap — for example, the session expires during a
 sleep — the earliest boundary is used, so the retroactive clock-out option
 always reaches back to when you last actively worked.

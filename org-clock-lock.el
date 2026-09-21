@@ -462,6 +462,22 @@ prompts fire) and ensures `:immediate-finish t' is set in the options plist."
   "Return the org-capture template entry for KEY, or nil."
   (cl-find key org-capture-templates :key #'car :test #'equal))
 
+(defun cl::minibuffer-bind-help (key text)
+  "Bind KEY, in the active minibuffer, to show TEXT via `minibuffer-message'.
+Call from a `minibuffer-with-setup-hook' function.  Installs a fresh
+child keymap parented to whatever local map is already active rather
+than mutating that map in place -- the active map for a plain
+`read-string'/`read-from-minibuffer' call is `minibuffer-local-map'
+itself, a single object shared across every such call in the session,
+so binding KEY directly on it would leak into unrelated prompts
+elsewhere; a child keymap keeps the binding local to this one
+minibuffer session while still falling through to every other binding
+via the parent."
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map (current-local-map))
+    (define-key map key (lambda () (interactive) (minibuffer-message text)))
+    (use-local-map map)))
+
 (defun cl::read-minutes (prompt default)
   "Read a session duration in minutes, returning a positive integer.
 PROMPT is displayed before the bracketed default value.
@@ -474,13 +490,22 @@ Accepts \"N\" or \"N-M\" (see `cl::parse-duration-spec', called with no
 GAP so a \"/O\" part is never offered here): a bare N is returned as is;
 \"N-M\" backdates by M, returning (max 0 (- N M)).  Unparsable input
 re-prompts with an explanation instead of silently falling back to
-DEFAULT."
+DEFAULT.  Press \"?\" at the prompt for a fuller explanation of the
+syntax, shown via `minibuffer-message' rather than crowding the prompt
+itself."
   (let (result)
     (while (null result)
-      (let* ((raw  (read-string
-                    (format "%s [default: %d min, N-M started M ago]: "
-                            prompt default)
-                    nil nil (number-to-string default)))
+      (let* ((raw  (minibuffer-with-setup-hook
+                       (lambda ()
+                         (cl::minibuffer-bind-help
+                          (kbd "?")
+                          "N      total minutes, as given
+N-M    N total minutes, but M of those already happened
+       -- it started M minutes ago"))
+                     (read-string
+                      (format "%s [default: %d min, ? for help]: "
+                              prompt default)
+                      nil nil (number-to-string default))))
              (spec (cl::parse-duration-spec raw default nil))
              (val  (and spec
                         (if (nth 3 spec)
@@ -887,17 +912,28 @@ violating the N+O<=GAP or `cl:session-limits' bounds, re-prompts with an
 explanation rather than silently falling back to a default.  An
 already-elapsed total (X<=N) is always a hard reject -- there is no
 \"just clock out\" fallback here; C-g at the top-level task picker is
-that fallback instead."
+that fallback instead.  Press \"?\" at the prompt for a fuller
+explanation of the syntax, shown via `minibuffer-message' rather than
+crowding the prompt itself."
   (let (result)
     (while (null result)
       (let ((raw (condition-case nil
-                     (read-string
-                      (format "Work on \"%s\" for [default: %d min%s]: "
-                              title default
-                              (if (> gap 0)
-                                  (format "; -N backdate, /O credit old (bare / = all), %dm since interrupt" gap)
-                                ""))
-                      nil nil (number-to-string default))
+                     (minibuffer-with-setup-hook
+                         (lambda ()
+                           (cl::minibuffer-bind-help
+                            (kbd "?")
+                            (format "X      total minutes for the task, counting from its actual start
+X-N    it actually started N minutes ago (backdated clock-in)
+X-N/O  also credit O minutes of the %dm gap back to the task just
+       clocked out (default: nothing credited)
+X-N/   a bare trailing / credits the whole remaining gap instead --
+       for a same-task pick with no backdate (X/), that keeps it
+       one unbroken clock entry"
+                                    gap)))
+                       (read-string
+                        (format "Work on \"%s\" for [default: %d min, ? for help]: "
+                                title default)
+                        nil nil (number-to-string default)))
                    (quit :quit))))
         (if (eq raw :quit)
             (setq result :quit)
