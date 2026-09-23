@@ -2029,13 +2029,31 @@ considered."
           (cl::apply-lock-layout buf))))))
 
 (defun cl::hide-lock-screen ()
-  "Restore each frame's saved window configuration."
-  (dolist (entry cl::saved-frame-wconfs)
-    (when (frame-live-p (car entry))
-      (with-selected-frame (car entry)
-        (condition-case nil
-            (set-window-configuration (cdr entry))
-          (error (bury-buffer))))))
+  "Restore each frame's saved window configuration.
+Also drops the lock buffer from every restored window's
+`window-prev-buffers'/`window-next-buffers', which the configuration
+itself doesn't cover: displaying the lock buffer records it in that
+per-window history (`switch-to-buffer''s NORECORD argument suppresses
+only the global recently-selected list, not this one), and
+`set-window-configuration' records it again as it swaps the real buffer
+back in.  Left there, it sits at the head of the history, so
+`previous-buffer' in a restored window goes to the lock screen instead
+of whatever the window showed before the interrupt."
+  (let ((buf (get-buffer cl::buf)))
+    (dolist (entry cl::saved-frame-wconfs)
+      (when (frame-live-p (car entry))
+        (with-selected-frame (car entry)
+          (condition-case nil
+              (set-window-configuration (cdr entry))
+            (error (bury-buffer)))
+          (when buf
+            (walk-windows
+             (lambda (w)
+               (set-window-prev-buffers
+                w (assq-delete-all buf (window-prev-buffers w)))
+               (set-window-next-buffers
+                w (delq buf (window-next-buffers w))))
+             nil (car entry)))))))
   (setq cl::saved-frame-wconfs nil))
 
 ;;; Header line
