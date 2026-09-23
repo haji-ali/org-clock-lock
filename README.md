@@ -116,6 +116,9 @@ The duration prompt accepts `X`, `X-N`, or `X-N/O`:
   gap, so no time is lost and the task stays one unbroken clock entry
   instead of a real clock-out followed by a fresh clock-in.
 
+The prompt line itself states the gap (`Nm since interrupt`), so how much
+time is up for grabs is visible while typing the spec.
+
 Press `?` at either this or the plain duration prompt (e.g. when picking a
 task from the lock screen) to toggle a fuller explanation of the syntax
 below the prompt — the minibuffer expands to fit it, similar to how a

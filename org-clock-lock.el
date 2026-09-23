@@ -961,9 +961,10 @@ violating the N+O<=GAP or `cl:session-limits' bounds, re-prompts with an
 explanation rather than silently falling back to a default.  An
 already-elapsed total (X<=N) is always a hard reject -- there is no
 \"just clock out\" fallback here; C-g at the top-level task picker is
-that fallback instead.  Press \"?\" at the prompt for a fuller
-explanation of the syntax (see `cl::minibuffer-bind-help'), toggled
-below the prompt instead of crowding it."
+that fallback instead.  The prompt itself carries GAP, so how much time
+is up for grabs stays visible while typing the spec; the syntax proper
+is behind \"?\" (see `cl::minibuffer-bind-help'), toggled below the
+prompt instead of crowding it."
   (let (result)
     (while (null result)
       (let ((raw (condition-case nil
@@ -980,8 +981,11 @@ X-N/   a bare trailing / credits the whole remaining gap instead --
        one unbroken clock entry"
                                     gap)))
                        (read-string
-                        (format "Work on \"%s\" for [default: %d min, ? for help]: "
-                                title default)
+                        (format "Work on \"%s\" for [default: %d min%s, ? for help]: "
+                                title default
+                                (if (> gap 0)
+                                    (format ", %dm since interrupt" gap)
+                                  ""))
                         nil nil (number-to-string default)))
                    (quit :quit))))
         (if (eq raw :quit)
