@@ -147,6 +147,23 @@ unannounced, and resolving here is always something you asked for by
 pressing \"t\" or \"c\" on a screen you were already looking at."
   :type 'boolean)
 
+(defcustom cl:debug-window-selection nil
+  "Non-nil to log how window selection is saved and restored by the lock.
+Every lock and unlock appends, to the buffer named by
+`org-clock-lock--diag-buf', the selected frame and window, each
+lockable frame's own selected window and current tab, and the call
+stack that triggered it.  For `cl:diag-watch-seconds' after an unlock,
+every later change of the selected window is logged too -- with the
+calling function stack when the change came from a Lisp
+`select-window'/`select-frame' call -- along with the first few
+commands run.  View the log with `org-clock-lock-show-diagnostics'."
+  :type 'boolean)
+
+(defcustom cl:diag-watch-seconds 5
+  "Seconds after an unlock during which selection changes are logged.
+Only used when `cl:debug-window-selection' is non-nil."
+  :type 'natnum)
+
 
 ;;; Faces
 
@@ -167,13 +184,15 @@ pressing \"t\" or \"c\" on a screen you were already looking at."
     (define-key m [remap save-buffer] #'ignore)
     (define-key m (kbd "t") #'cl::agenda-new-session)
     (define-key m (kbd "c") #'cl::agenda-resume-task)
+    (define-key m (kbd "u") #'cl:undo-clock-out)
     (define-key m (kbd "g") #'cl::agenda-redo)
     (define-key m (kbd "r") #'cl::agenda-redo)
     m)
   "Keymap layered over `org-agenda-mode-map' in the lock screen buffer.
 Shadows the agenda's own \"t\", since in this buffer it picks a task
 instead of cycling a TODO state.  Also shadows \"c\", used here to
-resume a pending interrupted task directly (see `cl::agenda-resume-task').")
+resume a pending interrupted task directly (see `cl::agenda-resume-task'),
+and \"u\", which undoes the last clock-out (see `org-clock-lock-undo-clock-out').")
 
 (defvar cl::log-line-map
   (let ((m (make-sparse-keymap)))
@@ -202,6 +221,7 @@ buffer-local minor modes on each redo."
   (let ((m (make-sparse-keymap)))
     (define-key m (kbd "C-c f d") #'org-clock-out)
     (define-key m (kbd "C-c f t") #'cl:switch-task)
+    (define-key m (kbd "C-c f u") #'cl:undo-clock-out)
     m)
   "Keymap for `cl:mode' (active while unlocked).")
 
@@ -218,7 +238,13 @@ buffer-local minor modes on each redo."
                    delete-window delete-other-windows
                    eval-last-sexp eval-buffer eval-region
                    org-agenda-quit org-agenda-Quit org-agenda-exit
-                   org-agenda-kill-all-agenda-buffers))
+                   org-agenda-kill-all-agenda-buffers
+                   tab-bar-select-tab tab-select
+                   tab-bar-switch-to-next-tab tab-next
+                   tab-bar-switch-to-prev-tab tab-previous
+                   tab-bar-switch-to-tab tab-switch
+                   tab-bar-switch-to-recent-tab tab-recent
+                   tab-bar-switch-to-last-tab tab-last))
       (define-key map (vector 'remap cmd) #'cl:blocked))
     (dolist (key '("C-h" "C-x 5" "C-x 4" "C-x t" "C-c p"))
       (define-key map (kbd key) #'cl:blocked))
@@ -249,6 +275,34 @@ Activation variable for `emulation-mode-map-alists'.")
 
 (defvar cl::saved-frame-wconfs nil
   "Alist of (FRAME . WCONF) saved before the lock screen was raised.")
+
+(defvar cl::saved-selection nil
+  "The window selected when the lock screen was raised, or nil.
+Nil too when that window was a minibuffer window or on a frame that
+isn't lockable (see `cl::lockable-frame-p').  Reselected explicitly by
+`cl::hide-lock-screen' once every frame's configuration is back:
+restoring each frame in turn leaves selected whichever frame was
+selected at unlock time, not the one selected at lock time.")
+
+(defvar cl::lock-tab-token nil
+  "Object tagging each frame's tab that was current at lock time.
+Stored under the `org-clock-lock' parameter of that tab.  The tab bar
+carries unknown tab parameters along when switching tabs, so the tab
+can be found again, and switched back to, if another tab gets selected
+while locked -- see `cl::select-locked-tab'.")
+
+(defvar cl::last-clock-out nil
+  "Plist describing the most recent clock-out, for `cl:undo-clock-out'.
+Keys: :hd-marker (the task's heading), :clock-marker (start of its
+CLOCK line, nil if org removed a zero-length one), :line (that line's
+text, to tell whether it was edited since), :title, :start and
+:end (time values of the clock entry), :planned (the session's planned
+minutes, or nil), :break-p.  Recorded by `cl::record-clock-out'.")
+
+(defvar cl::inhibit-clock-hooks nil
+  "Non-nil while org-clock-lock is clocking in or out on its own.
+Makes `cl::on-clock-out' and `cl::record-clock-out' do nothing, for
+changes whose lock/unlock and logging the caller handles itself.")
 
 (defvar cl::last-tick-time nil
   "Float-time of the most recent `cl::tick' call, or nil before the first tick.
@@ -336,19 +390,35 @@ user interacts with directly."
 (defun cl::enforce-lock-screen ()
   "Ensure every live, lockable frame's window layout includes the lock buffer.
 Frames not yet in `cl::saved-frame-wconfs' have their window
-configuration saved first.  See `cl::lockable-frame-p' for which frames
-are considered."
+configuration saved first.  A frame that was saved but has since had
+another tab selected is switched back to its locked tab instead (see
+`cl::select-locked-tab'), so the lock layout never lands in, and
+later overwrites, a second tab.  See `cl::lockable-frame-p' for which
+frames are considered."
   (when cl::locked-p
     (let ((buf (cl::ensure-lock-buffer)))
       (dolist (frame (frame-list))
         (when (and (frame-live-p frame) (cl::lockable-frame-p frame))
-          (unless (assq frame cl::saved-frame-wconfs)
+          (if (assq frame cl::saved-frame-wconfs)
+              (when-let* ((tab (with-selected-frame frame
+                                 (cl::select-locked-tab frame))))
+                (cl::diag "ENFORCE %S: locked tab %S" frame tab))
+            (cl::diag "ENFORCE %S: saving late frame" frame)
             (push (cons frame (with-selected-frame frame
                                 (current-window-configuration)))
-                  cl::saved-frame-wconfs))
+                  cl::saved-frame-wconfs)
+            (cl::tag-current-tab frame))
           (unless (get-buffer-window buf frame)
             (with-selected-frame frame
               (cl::apply-lock-layout buf))))))))
+
+(defun cl::on-tab-select (&rest _)
+  "Put the lock screen back after a tab switch while locked.
+On `tab-bar-tab-post-select-functions'.  `cl:locked-map' blocks the tab
+commands themselves, but not commands that call them as functions.
+Deferred to a timer since this runs in the middle of the switch."
+  (when cl::locked-p
+    (run-at-time 0 nil #'cl::enforce-lock-screen)))
 
 (defun cl:blocked ()
   "Feedback for blocked commands on the lock screen."
@@ -1444,16 +1514,178 @@ something new got clocked into in the same breath (handled below via
 `cl::adopt-running-clock'), the session is also finalized/logged here,
 since the plain `org-clocking-p'/`cl::locked-p' check below would
 otherwise skip `cl::end-session' entirely on the grounds that the
-screen is already locked."
-  (when cl::pending-interrupt
-    (setq cl::pending-interrupt nil)
-    (unless (org-clocking-p)
-      (cl::end-session)))
-  (unless
-      (if (org-clocking-p)
-          (cl::adopt-running-clock t)
-        cl::locked-p)
-    (cl::end-session)))
+screen is already locked.
+
+Does nothing while `cl::inhibit-clock-hooks' is non-nil."
+  (unless cl::inhibit-clock-hooks
+    (when cl::pending-interrupt
+      (setq cl::pending-interrupt nil)
+      (unless (org-clocking-p)
+        (cl::end-session)))
+    (unless
+        (if (org-clocking-p)
+            (cl::adopt-running-clock t)
+          cl::locked-p)
+      (cl::end-session))))
+
+;;; Undoing a clock-out
+
+(defconst cl::closed-clock-re
+  (concat "^[ \t]*" org-clock-string
+          "[ \t]*\\(\\[[^]\n]+\\]\\)--\\(\\[[^]\n]+\\]\\)")
+  "Regexp matching a closed CLOCK line; groups 1 and 2 are its timestamps.")
+
+(defun cl::forget-clock-out ()
+  "Clear `cl::last-clock-out', releasing its markers."
+  (dolist (key '(:hd-marker :clock-marker))
+    (when-let* ((m (plist-get cl::last-clock-out key)))
+      (set-marker m nil)))
+  (setq cl::last-clock-out nil))
+
+(defun cl::record-clock-out ()
+  "Remember the clock entry just closed, for `cl:undo-clock-out'.
+On `org-clock-out-hook', which runs in the task's buffer with point on
+the CLOCK line just closed -- unless org removed it for being zero
+length, in which case there is no line to reopen and only the start
+time is kept.  Does nothing while `cl::inhibit-clock-hooks' is non-nil."
+  (unless cl::inhibit-clock-hooks
+    (cl::forget-clock-out)
+    (save-excursion
+      (let* ((removed (bound-and-true-p org-clock-out-removed-last-clock))
+             (line    (and (not removed)
+                           (progn (forward-line 0)
+                                  (looking-at cl::closed-clock-re))
+                           (buffer-substring-no-properties
+                            (point) (line-end-position))))
+             (start   (if line
+                          (org-time-string-to-time (match-string 1))
+                        org-clock-start-time))
+             (clock   (and line (point-marker)))
+             (hd      (progn (org-back-to-heading t) (point-marker))))
+        (setq cl::last-clock-out
+              (list :hd-marker hd
+                    :clock-marker clock
+                    :line line
+                    :title (org-get-heading t t t t)
+                    :start start
+                    :end org-clock-out-time
+                    :planned (and cl::session
+                                  (cl::markers-equal-p
+                                   (cl::session-marker cl::session) hd)
+                                  (cl::session-planned-minutes cl::session))
+                    :break-p (and (org-entry-get hd "BREAK") t)))))))
+
+(defun cl::clock-out-undoable-p (last)
+  "Signal a `user-error' unless the clock-out LAST can still be undone.
+LAST is a `cl::last-clock-out' plist.  Its task must still exist and
+its CLOCK line, if it had one, must still read as it did at clock-out."
+  (let ((title (plist-get last :title))
+        (hd    (plist-get last :hd-marker))
+        (clock (plist-get last :clock-marker)))
+    (cond
+     ((null last)
+      (user-error "No clock-out to undo"))
+     (cl::pending-interrupt
+      (user-error "Resolve the pending interrupt first (%s)"
+                  (substitute-command-keys "\\[org-clock-lock-new-session]")))
+     ((not (marker-buffer hd))
+      (user-error "Can't undo: the task \"%s\" is gone" title))
+     ((and clock
+           (not (and (marker-buffer clock)
+                     (with-current-buffer (marker-buffer clock)
+                       (org-with-wide-buffer
+                        (goto-char clock)
+                        (equal (buffer-substring-no-properties
+                                (point) (line-end-position))
+                               (plist-get last :line)))))))
+      (user-error "Can't undo: the clock entry of \"%s\" changed since" title)))))
+
+(defun cl::fmt-clock-time (time)
+  "Format TIME as HH:MM, prefixed with the weekday when it isn't today."
+  (format-time-string
+   (if (equal (format-time-string "%F" time) (format-time-string "%F"))
+       "%H:%M"
+     "%a %H:%M")
+   time))
+
+(defun cl:undo-clock-out ()
+  "Undo the most recent clock-out, resuming that task's clock entry.
+The clocked-out task's CLOCK line is reopened -- it gets clocked in
+again from the entry's original start, as though it had never been
+clocked out, so the time since the clock-out counts toward it -- and
+whatever is clocked in now is canceled via `org-clock-cancel': its
+running CLOCK line is deleted and nothing is logged for it.  The
+clock-out's own entry in the lock screen's log is dropped too, since
+the reopened entry gets logged whole when it finally ends.
+
+Asks for confirmation first, spelling out both, then for the length of
+the resumed session (default: what was left of its planned time, if
+any worthwhile).  Nothing changes if either prompt is quit.
+
+Only the latest clock-out is remembered, and only until it is undone;
+it can't be undone once its CLOCK line was edited, or while an
+interrupt is pending (see `org-clock-lock-defer-interrupt-prompt')."
+  (interactive)
+  (let ((last cl::last-clock-out))
+    (cl::clock-out-undoable-p last)
+    (let* ((title    (plist-get last :title))
+           (start    (plist-get last :start))
+           (end      (plist-get last :end))
+           (planned  (plist-get last :planned))
+           (break-p  (plist-get last :break-p))
+           (now      (current-time))
+           (gap      (max 0 (round (float-time (time-subtract now end)) 60)))
+           (running  (and (org-clocking-p) org-clock-heading))
+           (run-mins (and running
+                          (max 0 (round (float-time
+                                         (time-subtract now org-clock-start-time))
+                                        60))))
+           (prompt
+            (concat
+             (format "Undo clock-out of \"%s\"?  Its entry from %s is reopened \
+as if never clocked out at %s, crediting it the %d min since.  "
+                     title (cl::fmt-clock-time start) (cl::fmt-clock-time end) gap)
+             (when running
+               (format "The running clock on \"%s\" (since %s, %d min) is \
+canceled, nothing kept or logged.  "
+                       running (cl::fmt-clock-time org-clock-start-time)
+                       run-mins)))))
+      (when (y-or-n-p prompt)
+        (let* ((elapsed   (round (float-time (time-subtract now start)) 60))
+               (remaining (and planned (- planned elapsed)))
+               (mins      (cl::read-minutes
+                           (format "Resume \"%s\" for" title)
+                           (cond
+                            ((and remaining
+                                  (>= remaining (car cl:session-limits)))
+                             remaining)
+                            (break-p cl:default-break)
+                            (t (or (cl::effort-minutes (plist-get last :hd-marker))
+                                   cl:default-duration)))))
+               (hd        (copy-marker (plist-get last :hd-marker)))
+               (clock     (plist-get last :clock-marker)))
+          (let ((cl::inhibit-clock-hooks t))
+            (when (org-clocking-p)
+              ;; In the clock's own buffer, since `org-clock-cancel-hook'
+              ;; runs in whatever buffer is current.
+              (with-current-buffer (org-clocking-buffer)
+                (org-clock-cancel))))
+          (when clock
+            (with-current-buffer (marker-buffer clock)
+              (org-with-wide-buffer
+               (goto-char clock)
+               (delete-region (line-beginning-position)
+                              (min (point-max) (line-beginning-position 2))))))
+          (setq cl::log-entries
+                (cl-remove-if (lambda (e) (equal (plist-get e :end) end))
+                              cl::log-entries))
+          (cl::forget-clock-out)
+          (cl::begin-session title hd mins nil start)
+          (when (and cl::session planned)
+            (setf (cl::session-planned-minutes cl::session) (+ planned mins)))
+          (message "Undid clock-out of \"%s\": clocked in since %s, %d more min%s"
+                   title (cl::fmt-clock-time start) mins
+                   (if running (format "; canceled \"%s\"" running) "")))))))
 
 ;;; State transitions
 
@@ -1962,6 +2194,9 @@ Reports that plainly, via org's own `org-clock-heading' rather than
 `cl::session', so it stays accurate even when the latter doesn't
 reflect what is actually clocked in.
 
+Otherwise, when a clock-out can be undone (`cl::last-clock-out'), a
+reminder of which task and that \"u\" undoes it.
+
 Nil in every other case (nothing to report)."
   (cond
    (cl::pending-interrupt
@@ -1979,7 +2214,13 @@ Nil in every other case (nothing to report)."
    ((org-clocking-p)
     (propertize
      (format "  ⏱ Clocked in: \"%s\"\n\n" org-clock-heading)
-     'face 'org-agenda-clocking))))
+     'face 'org-agenda-clocking))
+   (cl::last-clock-out
+    (propertize
+     (format "  ↶ Clocked out of \"%s\" at %s — u to undo\n\n"
+             (plist-get cl::last-clock-out :title)
+             (cl::fmt-clock-time (plist-get cl::last-clock-out :end)))
+     'face 'shadow))))
 
 (defun cl::agenda-finalize ()
   "Finalized lock buffer."
@@ -2016,20 +2257,79 @@ org-clock-lock preamble once the agenda content is in."
 (defun cl::show-lock-screen ()
   "Save each lockable frame's window config and show the lock buffer.
 Rebuilds the buffer on every call via `cl::refresh-lock-buffer' so it
-reflects current data.  See `cl::lockable-frame-p' for which frames are
-considered."
+reflects current data.  Also records the selected window
+\(`cl::saved-selection') and tags each frame's current tab (see
+`cl::lock-tab-token').
+
+A frame whose configuration is still saved from a lock that
+`cl::hide-lock-screen' never undid -- e.g. a failed clock-in in
+`cl::begin-session' locking again -- keeps that configuration, rather
+than having it replaced by the lock layout it currently shows.  See
+`cl::lockable-frame-p' for which frames are considered."
   (let ((frames (cl-remove-if-not #'cl::lockable-frame-p (frame-list))))
-    (setq cl::saved-frame-wconfs
-          (mapcar (lambda (f)
-                    (cons f (with-selected-frame f (current-window-configuration))))
-                  frames))
+    (if cl::saved-frame-wconfs
+        (cl::diag "LOCK again, keeping saved configurations of %s"
+                  (mapconcat (lambda (e) (format "%S" (car e)))
+                             cl::saved-frame-wconfs ", "))
+      (let ((w (selected-window)))
+        (setq cl::saved-selection (and (not (window-minibuffer-p w))
+                                       (memq (window-frame w) frames)
+                                       w)
+              cl::lock-tab-token (list 'org-clock-lock))))
+    (dolist (f frames)
+      (unless (assq f cl::saved-frame-wconfs)
+        (push (cons f (with-selected-frame f (current-window-configuration)))
+              cl::saved-frame-wconfs)
+        (cl::tag-current-tab f)))
+    (cl::diag "LOCK %s\n  by: %s\n  saved: %s\n%s"
+              (cl::diag-state) (cl::diag-callers)
+              (cl::diag-window cl::saved-selection) (cl::diag-frames frames))
     (let ((buf (cl::refresh-lock-buffer)))
       (dolist (f frames)
         (with-selected-frame f
           (cl::apply-lock-layout buf))))))
 
+(defun cl::restore-selection (window why)
+  "Select WINDOW, and its frame, unless it is already selected.
+Does nothing if WINDOW is dead, or on a frame that is no longer
+visible.  Returns non-nil if it selected WINDOW.  WHY is a label for the
+diagnostics log."
+  (when (and (window-live-p window)
+             (not (eq window (selected-window)))
+             (eq (frame-visible-p (window-frame window)) t))
+    (cl::diag "  reselect (%s): %s -> %s" why
+              (cl::diag-window (selected-window)) (cl::diag-window window))
+    (unless (eq (window-frame window) (selected-frame))
+      (select-frame-set-input-focus (window-frame window)))
+    (select-window window)
+    t))
+
+(defun cl::reassert-selection (window events)
+  "Reselect WINDOW if something else got selected since the unlock.
+Run from a zero-delay timer set by `cl::hide-lock-screen', i.e. once
+the command or timer that unlocked has finished.  EVENTS is
+`num-nonmacro-input-events' at unlock time: once any further input has
+been read, the selection is the user's to change and is left alone, as
+it is while locked again or while a minibuffer is active."
+  (when (and (not cl::locked-p)
+             (= events num-nonmacro-input-events)
+             (zerop (minibuffer-depth))
+             (cl::restore-selection window "after unlock")
+             cl:debug-window-selection)
+    (message "org-clock-lock: selection changed right after unlock; \
+restored it (see M-x org-clock-lock-show-diagnostics)")))
+
 (defun cl::hide-lock-screen ()
-  "Restore each frame's saved window configuration.
+  "Restore each frame's saved window configuration and selection.
+Before restoring a frame, switches it back to the tab that was current
+at lock time if another got selected meanwhile (see
+`cl::select-locked-tab'), so the configuration goes back into its own
+tab.  After restoring all of them, reselects the window selected at
+lock time (`cl::saved-selection'), which restoring several frames in
+turn doesn't necessarily leave selected, and once more after the
+current command in case something else selects another window
+meanwhile (see `cl::reassert-selection').
+
 Also drops the lock buffer from every restored window's
 `window-prev-buffers'/`window-next-buffers', which the configuration
 itself doesn't cover: displaying the lock buffer records it in that
@@ -2039,13 +2339,22 @@ only the global recently-selected list, not this one), and
 back in.  Left there, it sits at the head of the history, so
 `previous-buffer' in a restored window goes to the lock screen instead
 of whatever the window showed before the interrupt."
-  (let ((buf (get-buffer cl::buf)))
+  (let ((buf (get-buffer cl::buf))
+        (expected cl::saved-selection))
+    (when cl::saved-frame-wconfs
+      (cl::diag "UNLOCK %s\n  by: %s\n  expect: %s"
+                (cl::diag-state) (cl::diag-callers) (cl::diag-window expected)))
     (dolist (entry cl::saved-frame-wconfs)
       (when (frame-live-p (car entry))
         (with-selected-frame (car entry)
-          (condition-case nil
-              (set-window-configuration (cdr entry))
-            (error (bury-buffer)))
+          (let* ((tab (cl::select-locked-tab (car entry)))
+                 (res (condition-case err
+                          (set-window-configuration (cdr entry))
+                        (error (bury-buffer) err))))
+            (cl::diag "  restore %S%s: %S -> %s"
+                      (car entry) (if tab (format " (tab %S)" tab) "") res
+                      (cl::diag-window (frame-selected-window))))
+          (cl::untag-tabs (car entry))
           (when buf
             (walk-windows
              (lambda (w)
@@ -2053,18 +2362,209 @@ of whatever the window showed before the interrupt."
                 w (assq-delete-all buf (window-prev-buffers w)))
                (set-window-next-buffers
                 w (delq buf (window-next-buffers w))))
-             nil (car entry)))))))
-  (setq cl::saved-frame-wconfs nil))
+             nil (car entry))))))
+    (when cl::saved-frame-wconfs
+      (cl::restore-selection expected "after restore")
+      (cl::diag "  done: %s" (cl::diag-state))
+      (cl::diag-start-watch expected)
+      (run-at-time 0 nil #'cl::reassert-selection
+                   expected num-nonmacro-input-events)))
+  (setq cl::saved-frame-wconfs nil
+        cl::saved-selection nil
+        cl::lock-tab-token nil))
+
+;;; Tabs
+
+(declare-function tab-bar--current-tab-find "tab-bar" (&optional tabs frame))
+(declare-function tab-bar--current-tab-index "tab-bar" (&optional tabs frame))
+(declare-function tab-bar-select-tab "tab-bar" (&optional tab-number))
+
+(defun cl::tag-current-tab (frame)
+  "Tag FRAME's current tab, if it has tabs, with `cl::lock-tab-token'."
+  (when-let* ((token cl::lock-tab-token)
+              ((fboundp 'tab-bar--current-tab-find))
+              (tab (tab-bar--current-tab-find (frame-parameter frame 'tabs))))
+    (setf (alist-get 'org-clock-lock (cdr tab)) token)))
+
+(defun cl::untag-tabs (frame)
+  "Remove the lock tag from all of FRAME's tabs."
+  (dolist (tab (frame-parameter frame 'tabs))
+    (when (assq 'org-clock-lock (cdr tab))
+      (setcdr tab (assq-delete-all 'org-clock-lock (cdr tab))))))
+
+(defun cl::select-locked-tab (frame)
+  "Select FRAME's tab tagged at lock time, if another one is current.
+FRAME must be the selected frame.  Return nil when there's nothing to
+do (no tabs, or the tagged tab is current), \\='gone when the tagged tab
+was closed meanwhile, or (FROM . TO), the tab indices switched between."
+  (when-let* ((token cl::lock-tab-token)
+              ((fboundp 'tab-bar--current-tab-index))
+              (tabs (frame-parameter frame 'tabs)))
+    (let ((idx (seq-position tabs token
+                             (lambda (tab tok)
+                               (eq (alist-get 'org-clock-lock (cdr tab)) tok))))
+          (cur (tab-bar--current-tab-index tabs)))
+      (cond
+       ((null idx) 'gone)
+       ((not (eql idx cur))
+        (tab-bar-select-tab (1+ idx))
+        (cons cur idx))))))
+
+;;; Diagnostics
+
+(defconst cl::diag-buf " *org-clock-lock-diag*"
+  "Name of the buffer `cl:debug-window-selection' logs to.")
+
+(defvar cl::diag-watch nil
+  "Plist of the selection watch that follows an unlock, or nil.
+Keys: :window, the window expected to stay selected; :until, the
+`float-time' at which to stop; :commands, how many more commands to
+log; :timer, the timer that stops it.")
+
+(defun cl::diag (fmt &rest args)
+  "Log (format FMT ARGS) with a timestamp, if `cl:debug-window-selection'."
+  (when cl:debug-window-selection
+    (with-current-buffer (get-buffer-create cl::diag-buf)
+      (save-excursion
+        (goto-char (point-max))
+        (insert (format-time-string "%F %T.%3N ") (apply #'format fmt args) "\n")
+        (when (> (buffer-size) 500000)
+          (goto-char (/ (buffer-size) 2))
+          (delete-region (point-min) (line-beginning-position 2)))))))
+
+(defun cl::diag-window (window)
+  "Describe WINDOW, with its frame, for the diagnostics log."
+  (cond
+   ((not (windowp window)) (format "%S" window))
+   ((window-live-p window)
+    (format "%S in %S" window (window-frame window)))
+   (t (format "%S (dead)" window))))
+
+(defun cl::diag-state ()
+  "Describe the current selection and command for the diagnostics log."
+  (format "sel=%s cmd=%S ev=%S mb-depth=%d"
+          (cl::diag-window (selected-window))
+          this-command last-input-event (minibuffer-depth)))
+
+(defun cl::diag-frames (frames)
+  "Describe each of FRAMES, one per line, for the diagnostics log."
+  (mapconcat
+   (lambda (f)
+     (format "  %S vis=%S focus=%S tab=%S sel=%S"
+             f (frame-visible-p f) (frame-focus-state f)
+             (and (fboundp 'tab-bar--current-tab-index)
+                  (frame-parameter f 'tabs)
+                  (tab-bar--current-tab-index (frame-parameter f 'tabs)))
+             (frame-selected-window f)))
+   frames "\n"))
+
+(defun cl::diag-callers ()
+  "Return the functions on the call stack, innermost first, as a string."
+  (let (names)
+    (mapbacktrace
+     (lambda (evald fun _args _flags)
+       (when evald
+         (let ((name (if (symbolp fun) (symbol-name fun) "<lambda>")))
+           (unless (or (string-prefix-p "org-clock-lock--diag" name)
+                       (member name '("apply" "funcall" "mapbacktrace")))
+             (push name names))))))
+    (string-join (seq-take (nreverse names) 25) " < ")))
+
+(defun cl::diag-watching-p ()
+  "Non-nil while the post-unlock selection watch is on; stop it once due."
+  (when cl::diag-watch
+    (or (< (float-time) (plist-get cl::diag-watch :until))
+        (progn (cl::diag-stop-watch) nil))))
+
+(defun cl::diag-start-watch (window)
+  "Log selection changes for a while after an unlock expecting WINDOW.
+See `cl:diag-watch-seconds'."
+  (when cl:debug-window-selection
+    (cl::diag-stop-watch)
+    (setq cl::diag-watch
+          (list :window window
+                :until (+ (float-time) cl:diag-watch-seconds)
+                :commands 3
+                :timer (run-at-time cl:diag-watch-seconds nil
+                                    #'cl::diag-stop-watch)))
+    (add-hook 'window-selection-change-functions #'cl::diag-on-selection-change)
+    (add-hook 'post-command-hook #'cl::diag-on-post-command)
+    (advice-add 'select-window :before #'cl::diag-on-select-window)
+    (advice-add 'select-frame :before #'cl::diag-on-select-frame)))
+
+(defun cl::diag-stop-watch ()
+  "Stop the post-unlock selection watch."
+  (when-let* ((timer (plist-get cl::diag-watch :timer)))
+    (cancel-timer timer))
+  (when cl::diag-watch
+    (cl::diag "  watch over: %s" (cl::diag-state)))
+  (setq cl::diag-watch nil)
+  (remove-hook 'window-selection-change-functions #'cl::diag-on-selection-change)
+  (remove-hook 'post-command-hook #'cl::diag-on-post-command)
+  (advice-remove 'select-window #'cl::diag-on-select-window)
+  (advice-remove 'select-frame #'cl::diag-on-select-frame))
+
+(defun cl::diag-on-select-window (window &optional norecord)
+  "Log a recorded `select-window' of WINDOW during the watch, with callers.
+NORECORD selections are left out: `with-selected-window' and friends
+make them all the time and undo them straight after."
+  (when (and (not norecord)
+             (not (eq window (selected-window)))
+             (cl::diag-watching-p))
+    (cl::diag "  select-window %s (from %s)\n    by: %s"
+              (cl::diag-window window) (cl::diag-window (selected-window))
+              (cl::diag-callers))))
+
+(defun cl::diag-on-select-frame (frame &optional norecord)
+  "Log a recorded `select-frame' of FRAME during the watch, with callers."
+  (when (and (not norecord)
+             (not (eq frame (selected-frame)))
+             (cl::diag-watching-p))
+    (cl::diag "  select-frame %S (from %S)\n    by: %s"
+              frame (selected-frame) (cl::diag-callers))))
+
+(defun cl::diag-on-selection-change (frame)
+  "Log a change of selected window reported for FRAME during the watch.
+On `window-selection-change-functions', which reports every change,
+including those made from C (frame switches, mouse clicks,
+`set-window-configuration'), once redisplay notices it."
+  (when (cl::diag-watching-p)
+    (cl::diag "  selection changed (%S): %s%s cmd=%S ev=%S"
+              frame (cl::diag-window (selected-window))
+              (if (eq (selected-window) (plist-get cl::diag-watch :window))
+                  "" " [NOT the expected window]")
+              this-command last-input-event)))
+
+(defun cl::diag-on-post-command ()
+  "Log the first few commands after an unlock, then end the watch."
+  (when (cl::diag-watching-p)
+    (cl::diag "  after command %S: %s" this-command
+              (cl::diag-window (selected-window)))
+    (when (<= (cl-decf (plist-get cl::diag-watch :commands)) 0)
+      (cl::diag-stop-watch))))
+
+(defun cl:show-diagnostics ()
+  "Show the log kept while `org-clock-lock-debug-window-selection' is on."
+  (interactive)
+  (let ((buf (get-buffer-create cl::diag-buf)))
+    (with-current-buffer buf (goto-char (point-max)))
+    (pop-to-buffer buf)))
 
 ;;; Header line
 
 (defvar cl::original-header nil)
 
+(defconst cl::header-format
+  '(:eval (string-join (cl:ui-status-strings) " "))
+  "The `header-line-format' installed while a session runs.")
+
 (defun cl::install-header ()
   (when cl:show-header
-    (setq cl::original-header (default-value 'header-line-format))
-    (setq-default header-line-format
-                  '(:eval (string-join (cl:ui-status-strings) " ")))))
+    ;; Also called for a session begun while another's header is up, so
+    ;; don't mistake that header for the original one.
+    (unless (equal (default-value 'header-line-format) cl::header-format)
+      (setq cl::original-header (default-value 'header-line-format)))
+    (setq-default header-line-format cl::header-format)))
 
 (defun cl::remove-header ()
   (when cl:show-header
@@ -2081,7 +2581,7 @@ LOCKED   Full-frame lock screen: an org-agenda buffer, built by
          `org-clock-lock-agenda-log-block' or a clock report).
          `cl:locked-map' blocks navigation and buffer commands;
          \"t\" picks a task, \"c\" resumes a pending interrupted task
-         directly.
+         directly, \"u\" undoes the last clock-out.
 
 UNLOCKED Normal Emacs with optional header-line countdown.
          Break tasks (BREAK property) skip idle detection.
@@ -2093,6 +2593,8 @@ Session end
                  now, or C-c C-e to keep all time and clock out now.
   C-c f d      — org-clock-out; hook transitions to locked.
   C-c f t      — switch task; C-g keeps the current clock.
+  C-c f u      — undo the last clock-out: reopen that task's clock
+                 entry, canceling whatever is clocked in now.
   Idle/sleep   — same interrupt prompt, with the idle or sleep start as
                  boundary.  Call `cl:on-sleep' from a system-sleep hook
                  for a precise boundary.
@@ -2116,6 +2618,8 @@ Startup: adopts a running org clock if one exists."
           (push `((cl::locked-p . ,cl:locked-map))
                 emulation-mode-map-alists))
         (add-hook 'org-clock-out-hook #'cl::on-clock-out)
+        (add-hook 'org-clock-out-hook #'cl::record-clock-out -10)
+        (add-hook 'tab-bar-tab-post-select-functions #'cl::on-tab-select)
         (add-hook 'org-clock-cancel-hook #'cl::on-clock-out)
         (add-hook 'org-agenda-finalize-hook #'cl::agenda-finalize)
         (unless (cl::adopt-running-clock)
@@ -2126,6 +2630,8 @@ Startup: adopts a running org clock if one exists."
                                (assq 'org-clock-lock--locked-p e)))
                         emulation-mode-map-alists))
     (remove-hook 'org-clock-out-hook #'cl::on-clock-out)
+    (remove-hook 'org-clock-out-hook #'cl::record-clock-out)
+    (remove-hook 'tab-bar-tab-post-select-functions #'cl::on-tab-select)
     (remove-hook 'org-clock-cancel-hook #'cl::on-clock-out)
     (remove-hook 'org-agenda-finalize-hook #'cl::agenda-finalize)
     (cl::cancel-timers)
@@ -2134,7 +2640,8 @@ Startup: adopts a running org clock if one exists."
     (setq cl::locked-p            nil
           cl::saved-frame-wconfs  nil
           cl::session             nil
-          cl::pending-interrupt   nil)))
+          cl::pending-interrupt   nil)
+    (cl::forget-clock-out)))
 
 (provide 'org-clock-lock)
 

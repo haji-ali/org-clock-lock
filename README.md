@@ -41,10 +41,15 @@ When locked, Emacs shows a full-frame buffer with these action keys:
 |-------|-------------------------------------------|
 | `t`   | Pick a task and start working             |
 | `c`   | Resume the pending interrupted task directly, skipping the picker (see below) |
+| `u`   | Undo the last clock-out (see [Undoing a clock-out](#undoing-a-clock-out)) |
 | `TAB` | Collapse/expand the day log               |
 
 Navigation and buffer commands (`C-x b`, `C-x k`, `find-file`, window
-splits, etc.) are blocked while locked.
+splits, tab switching, etc.) are blocked while locked. A tab switch that
+gets through anyway (e.g. from a command calling the tab-bar functions
+directly) is undone straight away, and unlocking always restores the
+window layout into the tab that was current when the screen locked, then
+reselects the window that was selected then.
 
 The lock screen shows a scrollable log of today's sessions with spent and
 planned time, gaps between sessions, and a daily total. Past days are
@@ -82,6 +87,7 @@ toggle the break-only filter, restricting candidates to headings with the
 |-----------|------------------------------------------|
 | `C-c f d` | Clock out (lock screen returns)          |
 | `C-c f t` | Switch to a different task               |
+| `C-c f u` | Undo the last clock-out                  |
 
 An optional header line shows the task name, a countdown to session end,
 and hints for available commands. It turns to `⚠⏱` when fewer than
@@ -192,6 +198,34 @@ already looking at — `org-clock-lock-prompt-protect-seconds` keystroke
 protection, which exists to stop stray keystrokes from a prompt that
 appeared unannounced, is skipped in this mode.
 
+## Undoing a clock-out
+
+`org-clock-lock-undo-clock-out` (`u` on the lock screen, `C-c f u`
+otherwise) takes back the most recent clock-out, e.g. an accidental
+`C-c f d`, or a task switch you didn't mean. It reopens that task's CLOCK
+line, so the task is clocked in again from the entry's original start as
+if it had never been clocked out — the time since the clock-out counts
+toward it — and cancels whatever is clocked in now: its running CLOCK line
+is deleted, and nothing is logged for it. The clock-out's entry in the
+session log is dropped too; the reopened entry is logged whole when it
+ends.
+
+It asks for confirmation first, spelling out both, then for the length of
+the resumed session (defaulting to what was left of its planned time).
+Quitting either prompt changes nothing. Only the latest clock-out can be
+undone, once, and not after its CLOCK line was edited or while an interrupt
+is pending. The lock screen shows which clock-out `u` would undo.
+
+## Diagnosing window selection
+
+Set `org-clock-lock-debug-window-selection` to `t` to log each lock and
+unlock: the selected window, each frame's selected window and tab, and the
+function stack that triggered it. For
+`org-clock-lock-diag-watch-seconds` (5) after an unlock, or the first three
+commands, every change of the selected window is logged too, with the
+stack of whatever called `select-window`/`select-frame`. Show the log with
+`M-x org-clock-lock-show-diagnostics`.
+
 ## Customisation
 
 | Variable | Default | Description |
@@ -212,6 +246,8 @@ appeared unannounced, is skipped in this mode.
 | `org-clock-lock-prompt-protect-seconds` | 1 | Keystroke suppression window (seconds) when the interrupt prompt appears; `nil` to disable |
 | `org-clock-lock-prompt-protect-max-seconds` | 3 | Hard cap on prompt protection regardless of keystroke resets |
 | `org-clock-lock-prompt-protect-min-idle` | 60 | Idle seconds at which prompt protection is bypassed; `nil` to never bypass |
+| `org-clock-lock-debug-window-selection` | `nil` | Log how window selection is saved and restored (see above) |
+| `org-clock-lock-diag-watch-seconds` | 5 | How long selection changes are logged after an unlock |
 
 ## Hooks
 
