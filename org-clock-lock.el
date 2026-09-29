@@ -147,23 +147,6 @@ unannounced, and resolving here is always something you asked for by
 pressing \"t\" or \"c\" on a screen you were already looking at."
   :type 'boolean)
 
-(defcustom cl:debug-window-selection nil
-  "Non-nil to log how window selection is saved and restored by the lock.
-Every lock and unlock appends, to the buffer named by
-`org-clock-lock--diag-buf', the selected frame and window, each
-lockable frame's own selected window and current tab, and the call
-stack that triggered it.  For `cl:diag-watch-seconds' after an unlock,
-every later change of the selected window is logged too -- with the
-calling function stack when the change came from a Lisp
-`select-window'/`select-frame' call -- along with the first few
-commands run.  View the log with `org-clock-lock-show-diagnostics'."
-  :type 'boolean)
-
-(defcustom cl:diag-watch-seconds 5
-  "Seconds after an unlock during which selection changes are logged.
-Only used when `cl:debug-window-selection' is non-nil."
-  :type 'natnum)
-
 
 ;;; Faces
 
@@ -400,10 +383,8 @@ frames are considered."
       (dolist (frame (frame-list))
         (when (and (frame-live-p frame) (cl::lockable-frame-p frame))
           (if (assq frame cl::saved-frame-wconfs)
-              (when-let* ((tab (with-selected-frame frame
-                                 (cl::select-locked-tab frame))))
-                (cl::diag "ENFORCE %S: locked tab %S" frame tab))
-            (cl::diag "ENFORCE %S: saving late frame" frame)
+              (with-selected-frame frame
+                (cl::select-locked-tab frame))
             (push (cons frame (with-selected-frame frame
                                 (current-window-configuration)))
                   cl::saved-frame-wconfs)
@@ -2267,10 +2248,7 @@ A frame whose configuration is still saved from a lock that
 than having it replaced by the lock layout it currently shows.  See
 `cl::lockable-frame-p' for which frames are considered."
   (let ((frames (cl-remove-if-not #'cl::lockable-frame-p (frame-list))))
-    (if cl::saved-frame-wconfs
-        (cl::diag "LOCK again, keeping saved configurations of %s"
-                  (mapconcat (lambda (e) (format "%S" (car e)))
-                             cl::saved-frame-wconfs ", "))
+    (unless cl::saved-frame-wconfs
       (let ((w (selected-window)))
         (setq cl::saved-selection (and (not (window-minibuffer-p w))
                                        (memq (window-frame w) frames)
@@ -2281,28 +2259,21 @@ than having it replaced by the lock layout it currently shows.  See
         (push (cons f (with-selected-frame f (current-window-configuration)))
               cl::saved-frame-wconfs)
         (cl::tag-current-tab f)))
-    (cl::diag "LOCK %s\n  by: %s\n  saved: %s\n%s"
-              (cl::diag-state) (cl::diag-callers)
-              (cl::diag-window cl::saved-selection) (cl::diag-frames frames))
     (let ((buf (cl::refresh-lock-buffer)))
       (dolist (f frames)
         (with-selected-frame f
           (cl::apply-lock-layout buf))))))
 
-(defun cl::restore-selection (window why)
+(defun cl::restore-selection (window)
   "Select WINDOW, and its frame, unless it is already selected.
 Does nothing if WINDOW is dead, or on a frame that is no longer
-visible.  Returns non-nil if it selected WINDOW.  WHY is a label for the
-diagnostics log."
+visible."
   (when (and (window-live-p window)
              (not (eq window (selected-window)))
              (eq (frame-visible-p (window-frame window)) t))
-    (cl::diag "  reselect (%s): %s -> %s" why
-              (cl::diag-window (selected-window)) (cl::diag-window window))
     (unless (eq (window-frame window) (selected-frame))
       (select-frame-set-input-focus (window-frame window)))
-    (select-window window)
-    t))
+    (select-window window)))
 
 (defun cl::reassert-selection (window events)
   "Reselect WINDOW if something else got selected since the unlock.
@@ -2313,11 +2284,8 @@ been read, the selection is the user's to change and is left alone, as
 it is while locked again or while a minibuffer is active."
   (when (and (not cl::locked-p)
              (= events num-nonmacro-input-events)
-             (zerop (minibuffer-depth))
-             (cl::restore-selection window "after unlock")
-             cl:debug-window-selection)
-    (message "org-clock-lock: selection changed right after unlock; \
-restored it (see M-x org-clock-lock-show-diagnostics)")))
+             (zerop (minibuffer-depth)))
+    (cl::restore-selection window)))
 
 (defun cl::hide-lock-screen ()
   "Restore each frame's saved window configuration and selection.
@@ -2341,19 +2309,13 @@ back in.  Left there, it sits at the head of the history, so
 of whatever the window showed before the interrupt."
   (let ((buf (get-buffer cl::buf))
         (expected cl::saved-selection))
-    (when cl::saved-frame-wconfs
-      (cl::diag "UNLOCK %s\n  by: %s\n  expect: %s"
-                (cl::diag-state) (cl::diag-callers) (cl::diag-window expected)))
     (dolist (entry cl::saved-frame-wconfs)
       (when (frame-live-p (car entry))
         (with-selected-frame (car entry)
-          (let* ((tab (cl::select-locked-tab (car entry)))
-                 (res (condition-case err
-                          (set-window-configuration (cdr entry))
-                        (error (bury-buffer) err))))
-            (cl::diag "  restore %S%s: %S -> %s"
-                      (car entry) (if tab (format " (tab %S)" tab) "") res
-                      (cl::diag-window (frame-selected-window))))
+          (cl::select-locked-tab (car entry))
+          (condition-case nil
+              (set-window-configuration (cdr entry))
+            (error (bury-buffer)))
           (cl::untag-tabs (car entry))
           (when buf
             (walk-windows
@@ -2364,9 +2326,7 @@ of whatever the window showed before the interrupt."
                 w (delq buf (window-next-buffers w))))
              nil (car entry))))))
     (when cl::saved-frame-wconfs
-      (cl::restore-selection expected "after restore")
-      (cl::diag "  done: %s" (cl::diag-state))
-      (cl::diag-start-watch expected)
+      (cl::restore-selection expected)
       (run-at-time 0 nil #'cl::reassert-selection
                    expected num-nonmacro-input-events)))
   (setq cl::saved-frame-wconfs nil
@@ -2394,161 +2354,17 @@ of whatever the window showed before the interrupt."
 
 (defun cl::select-locked-tab (frame)
   "Select FRAME's tab tagged at lock time, if another one is current.
-FRAME must be the selected frame.  Return nil when there's nothing to
-do (no tabs, or the tagged tab is current), \\='gone when the tagged tab
-was closed meanwhile, or (FROM . TO), the tab indices switched between."
+FRAME must be the selected frame.  Does nothing if FRAME has no tabs or
+the tagged tab was closed meanwhile."
   (when-let* ((token cl::lock-tab-token)
               ((fboundp 'tab-bar--current-tab-index))
-              (tabs (frame-parameter frame 'tabs)))
-    (let ((idx (seq-position tabs token
-                             (lambda (tab tok)
-                               (eq (alist-get 'org-clock-lock (cdr tab)) tok))))
-          (cur (tab-bar--current-tab-index tabs)))
-      (cond
-       ((null idx) 'gone)
-       ((not (eql idx cur))
-        (tab-bar-select-tab (1+ idx))
-        (cons cur idx))))))
-
-;;; Diagnostics
-
-(defconst cl::diag-buf " *org-clock-lock-diag*"
-  "Name of the buffer `cl:debug-window-selection' logs to.")
-
-(defvar cl::diag-watch nil
-  "Plist of the selection watch that follows an unlock, or nil.
-Keys: :window, the window expected to stay selected; :until, the
-`float-time' at which to stop; :commands, how many more commands to
-log; :timer, the timer that stops it.")
-
-(defun cl::diag (fmt &rest args)
-  "Log (format FMT ARGS) with a timestamp, if `cl:debug-window-selection'."
-  (when cl:debug-window-selection
-    (with-current-buffer (get-buffer-create cl::diag-buf)
-      (save-excursion
-        (goto-char (point-max))
-        (insert (format-time-string "%F %T.%3N ") (apply #'format fmt args) "\n")
-        (when (> (buffer-size) 500000)
-          (goto-char (/ (buffer-size) 2))
-          (delete-region (point-min) (line-beginning-position 2)))))))
-
-(defun cl::diag-window (window)
-  "Describe WINDOW, with its frame, for the diagnostics log."
-  (cond
-   ((not (windowp window)) (format "%S" window))
-   ((window-live-p window)
-    (format "%S in %S" window (window-frame window)))
-   (t (format "%S (dead)" window))))
-
-(defun cl::diag-state ()
-  "Describe the current selection and command for the diagnostics log."
-  (format "sel=%s cmd=%S ev=%S mb-depth=%d"
-          (cl::diag-window (selected-window))
-          this-command last-input-event (minibuffer-depth)))
-
-(defun cl::diag-frames (frames)
-  "Describe each of FRAMES, one per line, for the diagnostics log."
-  (mapconcat
-   (lambda (f)
-     (format "  %S vis=%S focus=%S tab=%S sel=%S"
-             f (frame-visible-p f) (frame-focus-state f)
-             (and (fboundp 'tab-bar--current-tab-index)
-                  (frame-parameter f 'tabs)
-                  (tab-bar--current-tab-index (frame-parameter f 'tabs)))
-             (frame-selected-window f)))
-   frames "\n"))
-
-(defun cl::diag-callers ()
-  "Return the functions on the call stack, innermost first, as a string."
-  (let (names)
-    (mapbacktrace
-     (lambda (evald fun _args _flags)
-       (when evald
-         (let ((name (if (symbolp fun) (symbol-name fun) "<lambda>")))
-           (unless (or (string-prefix-p "org-clock-lock--diag" name)
-                       (member name '("apply" "funcall" "mapbacktrace")))
-             (push name names))))))
-    (string-join (seq-take (nreverse names) 25) " < ")))
-
-(defun cl::diag-watching-p ()
-  "Non-nil while the post-unlock selection watch is on; stop it once due."
-  (when cl::diag-watch
-    (or (< (float-time) (plist-get cl::diag-watch :until))
-        (progn (cl::diag-stop-watch) nil))))
-
-(defun cl::diag-start-watch (window)
-  "Log selection changes for a while after an unlock expecting WINDOW.
-See `cl:diag-watch-seconds'."
-  (when cl:debug-window-selection
-    (cl::diag-stop-watch)
-    (setq cl::diag-watch
-          (list :window window
-                :until (+ (float-time) cl:diag-watch-seconds)
-                :commands 3
-                :timer (run-at-time cl:diag-watch-seconds nil
-                                    #'cl::diag-stop-watch)))
-    (add-hook 'window-selection-change-functions #'cl::diag-on-selection-change)
-    (add-hook 'post-command-hook #'cl::diag-on-post-command)
-    (advice-add 'select-window :before #'cl::diag-on-select-window)
-    (advice-add 'select-frame :before #'cl::diag-on-select-frame)))
-
-(defun cl::diag-stop-watch ()
-  "Stop the post-unlock selection watch."
-  (when-let* ((timer (plist-get cl::diag-watch :timer)))
-    (cancel-timer timer))
-  (when cl::diag-watch
-    (cl::diag "  watch over: %s" (cl::diag-state)))
-  (setq cl::diag-watch nil)
-  (remove-hook 'window-selection-change-functions #'cl::diag-on-selection-change)
-  (remove-hook 'post-command-hook #'cl::diag-on-post-command)
-  (advice-remove 'select-window #'cl::diag-on-select-window)
-  (advice-remove 'select-frame #'cl::diag-on-select-frame))
-
-(defun cl::diag-on-select-window (window &optional norecord)
-  "Log a recorded `select-window' of WINDOW during the watch, with callers.
-NORECORD selections are left out: `with-selected-window' and friends
-make them all the time and undo them straight after."
-  (when (and (not norecord)
-             (not (eq window (selected-window)))
-             (cl::diag-watching-p))
-    (cl::diag "  select-window %s (from %s)\n    by: %s"
-              (cl::diag-window window) (cl::diag-window (selected-window))
-              (cl::diag-callers))))
-
-(defun cl::diag-on-select-frame (frame &optional norecord)
-  "Log a recorded `select-frame' of FRAME during the watch, with callers."
-  (when (and (not norecord)
-             (not (eq frame (selected-frame)))
-             (cl::diag-watching-p))
-    (cl::diag "  select-frame %S (from %S)\n    by: %s"
-              frame (selected-frame) (cl::diag-callers))))
-
-(defun cl::diag-on-selection-change (frame)
-  "Log a change of selected window reported for FRAME during the watch.
-On `window-selection-change-functions', which reports every change,
-including those made from C (frame switches, mouse clicks,
-`set-window-configuration'), once redisplay notices it."
-  (when (cl::diag-watching-p)
-    (cl::diag "  selection changed (%S): %s%s cmd=%S ev=%S"
-              frame (cl::diag-window (selected-window))
-              (if (eq (selected-window) (plist-get cl::diag-watch :window))
-                  "" " [NOT the expected window]")
-              this-command last-input-event)))
-
-(defun cl::diag-on-post-command ()
-  "Log the first few commands after an unlock, then end the watch."
-  (when (cl::diag-watching-p)
-    (cl::diag "  after command %S: %s" this-command
-              (cl::diag-window (selected-window)))
-    (when (<= (cl-decf (plist-get cl::diag-watch :commands)) 0)
-      (cl::diag-stop-watch))))
-
-(defun cl:show-diagnostics ()
-  "Show the log kept while `org-clock-lock-debug-window-selection' is on."
-  (interactive)
-  (let ((buf (get-buffer-create cl::diag-buf)))
-    (with-current-buffer buf (goto-char (point-max)))
-    (pop-to-buffer buf)))
+              (tabs (frame-parameter frame 'tabs))
+              (idx (seq-position tabs token
+                                 (lambda (tab tok)
+                                   (eq (alist-get 'org-clock-lock (cdr tab))
+                                       tok))))
+              ((not (eql idx (tab-bar--current-tab-index tabs)))))
+    (tab-bar-select-tab (1+ idx))))
 
 ;;; Header line
 

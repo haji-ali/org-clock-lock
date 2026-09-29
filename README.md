@@ -216,16 +216,6 @@ Quitting either prompt changes nothing. Only the latest clock-out can be
 undone, once, and not after its CLOCK line was edited or while an interrupt
 is pending. The lock screen shows which clock-out `u` would undo.
 
-## Diagnosing window selection
-
-Set `org-clock-lock-debug-window-selection` to `t` to log each lock and
-unlock: the selected window, each frame's selected window and tab, and the
-function stack that triggered it. For
-`org-clock-lock-diag-watch-seconds` (5) after an unlock, or the first three
-commands, every change of the selected window is logged too, with the
-stack of whatever called `select-window`/`select-frame`. Show the log with
-`M-x org-clock-lock-show-diagnostics`.
-
 ## Customisation
 
 | Variable | Default | Description |
@@ -246,8 +236,6 @@ stack of whatever called `select-window`/`select-frame`. Show the log with
 | `org-clock-lock-prompt-protect-seconds` | 1 | Keystroke suppression window (seconds) when the interrupt prompt appears; `nil` to disable |
 | `org-clock-lock-prompt-protect-max-seconds` | 3 | Hard cap on prompt protection regardless of keystroke resets |
 | `org-clock-lock-prompt-protect-min-idle` | 60 | Idle seconds at which prompt protection is bypassed; `nil` to never bypass |
-| `org-clock-lock-debug-window-selection` | `nil` | Log how window selection is saved and restored (see above) |
-| `org-clock-lock-diag-watch-seconds` | 5 | How long selection changes are logged after an unlock |
 
 ## Hooks
 
