@@ -51,6 +51,20 @@ directly) is undone straight away, and unlocking always restores the
 window layout into the tab that was current when the screen locked, then
 reselects the window that was selected then.
 
+To leave the lock unenforced at certain times, set
+`org-clock-lock-bypass-function` to a function of no arguments. Whenever it
+returns non-nil, everything works as usual except that nothing is blocked:
+you can leave the lock screen and come back to it. The function is checked
+when the screen locks and after every command while locked, so enforcement
+follows it automatically: once it returns nil again, the lock is enforced and
+the lock screen is put back in every frame.
+
+```elisp
+;; Only enforce the lock between 8am and 6pm.
+(setq org-clock-lock-bypass-function
+      (lambda () (not (<= 8 (decoded-time-hour (decode-time)) 17))))
+```
+
 The lock screen shows a scrollable log of today's sessions with spent and
 planned time, gaps between sessions, and a daily total. Past days are
 collapsed into a header line and can be expanded with `TAB`. Below the log

@@ -108,6 +108,30 @@ To reserve part of the frame for note-taking while locked, for example:
           (other-window 1)))"
   :type 'function)
 
+(defcustom cl:bypass-function nil
+  "Function deciding whether the lock is enforced, or nil to always enforce.
+Called with no arguments when the screen locks, and again after every
+command while locked (so keep it cheap).  While it returns non-nil,
+everything works as usual -- the lock screen is shown, sessions,
+interrupts and prompts behave the same -- except that the lock is not
+enforced: `cl:locked-map' is inactive and the lock screen is not forced
+back, so you can switch buffers, tabs and windows freely.
+
+Enforcement follows the function's value automatically in both
+directions.  Once it returns nil again, the lock is enforced from the
+next command on and the lock screen is put back in every frame (deferred
+while a minibuffer is active).  Since keymaps are looked up before a
+command runs, the command during which the value changes is itself
+neither blocked nor, in the other direction, let through by the lock --
+except that a blocked command lifts the lock straight away.
+
+For example, to only enforce the lock during working hours:
+
+  (setq org-clock-lock-bypass-function
+        (lambda ()
+          (not (<= 8 (decoded-time-hour (decode-time)) 17))))"
+  :type '(choice (const :tag "Always enforce" nil) function))
+
 (defcustom cl:clock-out-on-sleep nil
   "Non-nil to clock out automatically when a sleep/wake cycle is detected.
 The clock entry is ended at the last known awake time (i.e. the tick
@@ -247,8 +271,17 @@ buffer-local minor modes on each redo."
 ;;; Internal state
 
 (defvar cl::locked-p nil
-  "Nil when unlocked; `cl:locked-map' when locked.
-Activation variable for `emulation-mode-map-alists'.")
+  "Nil when unlocked; `cl:locked-map' when locked.")
+
+(defvar cl::enforced-p nil
+  "Non-nil while locked and the lock is enforced.
+Nil when unlocked, or when `cl:bypass-function' bypasses the lock.
+Activation variable for `cl:locked-map' in `emulation-mode-map-alists'.
+Kept up to date while locked by `cl::update-enforcement'.")
+
+(defvar cl::enforce-pending nil
+  "Non-nil when the lock became enforced but the lock screen isn't back yet.
+See `cl::update-enforcement'.")
 
 (defvar cl::session nil
   "The active `cl::session' struct, or nil when locked.")
@@ -378,7 +411,7 @@ another tab selected is switched back to its locked tab instead (see
 `cl::select-locked-tab'), so the lock layout never lands in, and
 later overwrites, a second tab.  See `cl::lockable-frame-p' for which
 frames are considered."
-  (when cl::locked-p
+  (when cl::enforced-p
     (let ((buf (cl::ensure-lock-buffer)))
       (dolist (frame (frame-list))
         (when (and (frame-live-p frame) (cl::lockable-frame-p frame))
@@ -398,16 +431,52 @@ frames are considered."
 On `tab-bar-tab-post-select-functions'.  `cl:locked-map' blocks the tab
 commands themselves, but not commands that call them as functions.
 Deferred to a timer since this runs in the middle of the switch."
-  (when cl::locked-p
+  (when cl::enforced-p
     (run-at-time 0 nil #'cl::enforce-lock-screen)))
 
+(defun cl::bypass-p ()
+  "Non-nil if `cl:bypass-function' says not to enforce the lock."
+  (and cl:bypass-function
+       (with-demoted-errors "org-clock-lock: bypass function error: %S"
+         (funcall cl:bypass-function))))
+
+(defun cl::update-enforcement ()
+  "Enforce the lock or not, following `cl:bypass-function'.
+On `post-command-hook' while locked.  When the lock becomes enforced,
+the lock screen is put back in every frame once no minibuffer is active;
+when it stops being enforced, nothing else changes."
+  (with-demoted-errors "org-clock-lock: enforcement error: %S"
+    (when cl::locked-p
+      (let ((enforce (not (cl::bypass-p))))
+        (cond
+         ((and enforce (not cl::enforced-p))
+          (setq cl::enforced-p t
+                cl::enforce-pending t))
+         ((and (not enforce) cl::enforced-p)
+          (setq cl::enforced-p nil
+                cl::enforce-pending nil)
+          (message "Lock no longer enforced"))))
+      (when (and cl::enforce-pending (not (active-minibuffer-window)))
+        (setq cl::enforce-pending nil)
+        (cl::enforce-lock-screen)
+        (message
+         (substitute-command-keys
+          "LOCKED again — \\[org-clock-lock-new-session] to pick a task."))))))
+
 (defun cl:blocked ()
-  "Feedback for blocked commands on the lock screen."
+  "Feedback for blocked commands on the lock screen.
+If `cl:bypass-function' now bypasses the lock, stop enforcing it
+instead, so the command can be repeated."
   (interactive)
-  (cl::enforce-lock-screen)
-  (message
-   (substitute-command-keys
-    "LOCKED — \\[org-clock-lock-new-session] to pick a task.")))
+  (if (cl::bypass-p)
+      (progn
+        (setq cl::enforced-p nil
+              cl::enforce-pending nil)
+        (message "Lock no longer enforced; repeat the command."))
+    (cl::enforce-lock-screen)
+    (message
+     (substitute-command-keys
+      "LOCKED — \\[org-clock-lock-new-session] to pick a task."))))
 
 ;;; Org / task helpers
 
@@ -1680,7 +1749,10 @@ MINUTES (see the backdated-switch path in `cl::interrupt-prompt').
 START-TIME, when non-nil, backdates the clock-in to that time instead
 of clocking in now; passed straight through to `org-clock-in'."
   (cl-block nil
-    (setq cl::locked-p nil)
+    (setq cl::locked-p nil
+          cl::enforced-p nil
+          cl::enforce-pending nil)
+    (remove-hook 'post-command-hook #'cl::update-enforcement)
     (let* ((prev-planned (and continue cl::session
                               (cl::session-planned-minutes cl::session)))
            (planned    (+ (or prev-planned 0) minutes
@@ -1747,7 +1819,10 @@ Also end current session, unless KEEP-STATE is non-nil."
       (setq cl::session nil)))
   (unless cl::locked-p
     (cl::remove-header)
-    (setq cl::locked-p cl:locked-map)
+    (setq cl::locked-p cl:locked-map
+          cl::enforced-p (not (cl::bypass-p))
+          cl::enforce-pending nil)
+    (add-hook 'post-command-hook #'cl::update-enforcement)
     (cl::show-lock-screen)))
 
 (defun cl::org-clock-out (&rest args)
@@ -2388,6 +2463,13 @@ the tagged tab was closed meanwhile."
 
 ;;; Minor mode
 
+(defun cl::emulation-entry-p (entry)
+  "Non-nil if ENTRY of `emulation-mode-map-alists' is `cl:mode''s.
+Also matches the entry keyed on `cl::locked-p' by earlier versions."
+  (and (consp entry)
+       (or (assq 'org-clock-lock--enforced-p entry)
+           (assq 'org-clock-lock--locked-p entry))))
+
 ;;;###autoload
 (define-minor-mode cl:mode
   "Block Emacs until you choose an org task, then protect your focus.
@@ -2426,13 +2508,11 @@ Startup: adopts a running org clock if one exists."
   :global t :lighter " 🔒"
   (if cl:mode
       (progn
-        (unless
-            (cl-find-if (lambda (e)
-                          (and (consp e )
-                               (assq 'org-clock-lock--locked-p e)))
-                        emulation-mode-map-alists)
-          (push `((cl::locked-p . ,cl:locked-map))
-                emulation-mode-map-alists))
+        (setq emulation-mode-map-alists
+              (cl-remove-if #'cl::emulation-entry-p
+                            emulation-mode-map-alists))
+        (push `((cl::enforced-p . ,cl:locked-map))
+              emulation-mode-map-alists)
         (add-hook 'org-clock-out-hook #'cl::on-clock-out)
         (add-hook 'org-clock-out-hook #'cl::record-clock-out -10)
         (add-hook 'tab-bar-tab-post-select-functions #'cl::on-tab-select)
@@ -2441,19 +2521,19 @@ Startup: adopts a running org clock if one exists."
         (unless (cl::adopt-running-clock)
           (cl::end-session)))
     (setq emulation-mode-map-alists
-          (cl-remove-if (lambda (e)
-                          (and (consp e )
-                               (assq 'org-clock-lock--locked-p e)))
-                        emulation-mode-map-alists))
+          (cl-remove-if #'cl::emulation-entry-p emulation-mode-map-alists))
     (remove-hook 'org-clock-out-hook #'cl::on-clock-out)
     (remove-hook 'org-clock-out-hook #'cl::record-clock-out)
     (remove-hook 'tab-bar-tab-post-select-functions #'cl::on-tab-select)
     (remove-hook 'org-clock-cancel-hook #'cl::on-clock-out)
     (remove-hook 'org-agenda-finalize-hook #'cl::agenda-finalize)
+    (remove-hook 'post-command-hook #'cl::update-enforcement)
     (cl::cancel-timers)
     (cl::hide-lock-screen)
     (cl::remove-header)
     (setq cl::locked-p            nil
+          cl::enforced-p          nil
+          cl::enforce-pending     nil
           cl::saved-frame-wconfs  nil
           cl::session             nil
           cl::pending-interrupt   nil)
