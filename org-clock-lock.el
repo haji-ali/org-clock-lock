@@ -2279,9 +2279,13 @@ Nil in every other case (nothing to report)."
      'face 'shadow))))
 
 (defun cl::agenda-finalize ()
-  "Finalized lock buffer."
+  "Finalized lock buffer.
+The status line is only prepended when finalizing the whole buffer:
+`org-agenda-change-all-lines' also runs `org-agenda-finalize-hook',
+narrowed to each agenda line it rewrites (e.g. after `org-agenda-todo')."
   (when (equal (buffer-name) cl::buf)
-    (when-let* ((status (cl::lock-status-line)))
+    (when-let* (((not (buffer-narrowed-p)))
+                (status (cl::lock-status-line)))
       (let ((inhibit-read-only t))
         (save-excursion
           (goto-char (point-min))
