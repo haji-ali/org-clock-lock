@@ -56,7 +56,10 @@ it.  Session expiry (the planned duration legitimately running out) is
 never auto-continued this way, no matter how small the resulting gap
 turns out to be -- that is always a deliberate stopping point, not
 incidental absence, so `cl::interrupt-boundary' resolving to \\='expired
-always goes through the normal locked flow."
+always goes through the normal locked flow.  A gap this small is still
+credited to the interrupted task by default when the interrupt is
+resolved (`cl::parse-duration-spec'), so picking that same task again
+continues its clock entry instead of clocking out."
   :type '(choice (const  :tag "Disabled" nil)
                  (natnum :tag "Max gap minutes")))
 
@@ -1008,6 +1011,12 @@ Resets `cl::last-tick-time' to now before returning."
       (cl-reduce (lambda (a b) (if (< (float-time (cdr a)) (float-time (cdr b))) a b))
                  candidates))))
 
+(defun cl::credit-gap-by-default-p (gap)
+  "Non-nil when an interrupt GAP of minutes is credited back by default.
+That is, when GAP is at most `cl:auto-continue-max-gap-minutes'."
+  (and gap cl:auto-continue-max-gap-minutes
+       (<= gap cl:auto-continue-max-gap-minutes)))
+
 (defun cl::parse-duration-spec (raw default gap)
   "Parse RAW as \"N\", \"N-M\", or \"N-M/O\".
 DEFAULT is substituted for N when omitted; M defaults to 0.
@@ -1015,7 +1024,10 @@ GAP, when non-nil, bounds M+O — the two must never claim more than GAP
 — and permits a trailing \"/O\" part.  When GAP is nil, a \"/O\" part is
 rejected as unparsable: there is no gap to credit anything from.
 
-O defaults to 0 (nothing credited) when \"/O\" is omitted entirely.  A
+O defaults to 0 (nothing credited) when \"/O\" is omitted entirely,
+unless GAP is small enough to credit by default
+(`cl::credit-gap-by-default-p'), in which case it defaults to the
+maximum, as for a bare \"/\".  A
 bare trailing \"/\" with no digits after it — only meaningful when GAP is
 given — instead credits the maximum possible, (- GAP M): a caller can
 offer \"credit everything\" without knowing GAP itself, and without that
@@ -1031,7 +1043,8 @@ way, if a \"/O\" part is present without GAP, or if M+O exceeds GAP."
     (let* ((n      (if (match-string 1 raw) (string-to-number (match-string 1 raw)) default))
            (m      (if (match-string 3 raw) (string-to-number (match-string 3 raw)) 0))
            (o      (cond
-                    ((not (match-string 4 raw)) 0)
+                    ((not (match-string 4 raw))
+                     (if (cl::credit-gap-by-default-p gap) (max 0 (- gap m)) 0))
                     ((match-string 5 raw) (string-to-number (match-string 5 raw)))
                     (t (max 0 (- (or gap 0) m)))))
            (dash-p (and (match-string 2 raw) t)))
@@ -1069,7 +1082,9 @@ Accepts \"X\", \"X-N\", or \"X-N/O\" (see `cl::parse-duration-spec'):
   N — TITLE actually started N minutes ago (backdated clock-in).
   O — of GAP (minus N), O minutes are credited back to the task just
       clocked out instead of staying dead.  Omitting \"/O\" entirely
-      credits nothing, the default.  A bare trailing \"/\" credits the
+      credits nothing, the default, unless GAP is small enough to be
+      credited in full (`cl::credit-gap-by-default-p').  A bare
+      trailing \"/\" credits the
       maximum instead, (- GAP N) -- for a same-task continue with no
       backdate (\"X/\"), that credits the whole gap, so nothing was ever
       dead and `cl::interrupt-pick' keeps it a single unbroken clock
@@ -1095,16 +1110,21 @@ prompt instead of crowding it."
                             (format "X      total minutes for the task, counting from its actual start
 X-N    it actually started N minutes ago (backdated clock-in)
 X-N/O  also credit O minutes of the %dm gap back to the task just
-       clocked out (default: nothing credited)
+       clocked out (default: %s)
 X-N/   a bare trailing / credits the whole remaining gap instead --
        for a same-task pick with no backdate (X/), that keeps it
        one unbroken clock entry"
-                                    gap)))
+                                    gap
+                                    (if (cl::credit-gap-by-default-p gap)
+                                        "the whole gap, as it is this small"
+                                      "nothing credited"))))
                        (read-string
                         (format "Work on \"%s\" for [default: %d min%s, ? for help]: "
                                 title default
                                 (if (> gap 0)
-                                    (format ", %dm since interrupt" gap)
+                                    (format ", %dm since interrupt%s" gap
+                                            (if (cl::credit-gap-by-default-p gap)
+                                                " credited back" ""))
                                   ""))
                         nil nil (number-to-string default)))
                    (quit :quit))))
